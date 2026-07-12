@@ -1,0 +1,357 @@
+[[types]]
+name = "story"
+plural = "stories"
+dir = "docs/stories"
+prefix = "STORY"
+icon = "▲"
+intent = "Capture one unit of user-facing value as a written, testable requirement with acceptance criteria."
+numbering = "incremental"
+subdirectory = false
+store = "filesystem"
+singleton = false
+agents = []
+authorship = "assisted"
+attributes = []
+
+[types.lifecycle]
+states = [
+    "draft",
+    "review",
+    "accepted",
+    "in-progress",
+    "complete",
+    "rejected",
+    "superseded",
+]
+
+[[types.lifecycle.edges]]
+from = "draft"
+to = "review"
+
+[[types.lifecycle.edges]]
+from = "review"
+to = "accepted"
+
+[[types.lifecycle.edges]]
+from = "review"
+to = "rejected"
+
+[[types.lifecycle.edges]]
+from = "accepted"
+to = "in-progress"
+
+[[types.lifecycle.edges]]
+from = "in-progress"
+to = "complete"
+
+[[types.lifecycle.edges]]
+from = "*"
+to = "superseded"
+
+[[types]]
+name = "bug"
+plural = "bugs"
+dir = "docs/bugs"
+prefix = "BUG"
+icon = "🐛"
+intent = "Report an observed defect — expected vs actual with repro steps — and track it to resolution."
+numbering = "incremental"
+subdirectory = false
+store = "filesystem"
+singleton = false
+agents = []
+authorship = "assisted"
+attributes = []
+
+[types.lifecycle]
+states = [
+    "reported",
+    "triaged",
+    "in-progress",
+    "fixed",
+    "wontfix",
+]
+
+[[types.lifecycle.edges]]
+from = "reported"
+to = "triaged"
+
+[[types.lifecycle.edges]]
+from = "triaged"
+to = "in-progress"
+
+[[types.lifecycle.edges]]
+from = "in-progress"
+to = "fixed"
+
+[[types.lifecycle.edges]]
+from = "reported"
+to = "wontfix"
+
+[[types.lifecycle.edges]]
+from = "triaged"
+to = "wontfix"
+
+[[types]]
+name = "iteration"
+plural = "iterations"
+dir = "docs/iterations"
+prefix = "ITERATION"
+icon = "◆"
+intent = "A bounded, self-contained dev plan handing one slice of a story or bug to a coding agent to execute."
+numbering = "incremental"
+subdirectory = false
+store = "filesystem"
+singleton = false
+agents = []
+authorship = "generated"
+attributes = []
+
+[types.lifecycle]
+states = [
+    "draft",
+    "review",
+    "accepted",
+    "in-progress",
+    "complete",
+    "rejected",
+    "superseded",
+]
+
+[[types.lifecycle.edges]]
+from = "draft"
+to = "review"
+
+[[types.lifecycle.edges]]
+from = "review"
+to = "accepted"
+
+[[types.lifecycle.edges]]
+from = "review"
+to = "rejected"
+
+[[types.lifecycle.edges]]
+from = "accepted"
+to = "in-progress"
+
+[[types.lifecycle.edges]]
+from = "in-progress"
+to = "complete"
+
+[[types.lifecycle.edges]]
+from = "*"
+to = "superseded"
+
+[[types]]
+name = "adr"
+plural = "adrs"
+dir = "docs/adrs"
+prefix = "ADR"
+icon = "■"
+intent = "Record one architectural decision — its context, the choice, and its consequences — to inform the architecture."
+numbering = "incremental"
+subdirectory = false
+store = "filesystem"
+singleton = false
+agents = []
+authorship = "assisted"
+attributes = []
+
+[types.lifecycle]
+states = [
+    "draft",
+    "review",
+    "accepted",
+    "in-progress",
+    "complete",
+    "rejected",
+    "superseded",
+]
+
+[[types.lifecycle.edges]]
+from = "draft"
+to = "review"
+
+[[types.lifecycle.edges]]
+from = "review"
+to = "accepted"
+
+[[types.lifecycle.edges]]
+from = "review"
+to = "rejected"
+
+[[types.lifecycle.edges]]
+from = "accepted"
+to = "in-progress"
+
+[[types.lifecycle.edges]]
+from = "in-progress"
+to = "complete"
+
+[[types.lifecycle.edges]]
+from = "*"
+to = "superseded"
+
+[[types]]
+name = "convention"
+plural = "convention"
+dir = "docs/convention"
+prefix = "CONVENTION"
+icon = "📜"
+intent = "The project's single conventions document — how we do things here."
+numbering = "incremental"
+subdirectory = true
+store = "filesystem"
+singleton = true
+agents = []
+authorship = "assisted"
+attributes = []
+
+[types.lifecycle]
+states = [
+    "draft",
+    "review",
+    "accepted",
+    "in-progress",
+    "complete",
+    "rejected",
+    "superseded",
+]
+
+[[types.lifecycle.edges]]
+from = "draft"
+to = "review"
+
+[[types.lifecycle.edges]]
+from = "review"
+to = "accepted"
+
+[[types.lifecycle.edges]]
+from = "review"
+to = "rejected"
+
+[[types.lifecycle.edges]]
+from = "accepted"
+to = "in-progress"
+
+[[types.lifecycle.edges]]
+from = "in-progress"
+to = "complete"
+
+[[types.lifecycle.edges]]
+from = "*"
+to = "superseded"
+
+[[types]]
+name = "principle"
+plural = "principles"
+dir = "docs/convention"
+prefix = "PRINCIPLE"
+icon = "⚖"
+intent = "A durable guiding principle that shapes decisions across the project."
+numbering = "incremental"
+subdirectory = false
+store = "filesystem"
+singleton = false
+parent_type = "convention"
+agents = []
+authorship = "assisted"
+attributes = []
+
+[types.lifecycle]
+states = [
+    "draft",
+    "review",
+    "accepted",
+    "in-progress",
+    "complete",
+    "rejected",
+    "superseded",
+]
+
+[[types.lifecycle.edges]]
+from = "draft"
+to = "review"
+
+[[types.lifecycle.edges]]
+from = "review"
+to = "accepted"
+
+[[types.lifecycle.edges]]
+from = "review"
+to = "rejected"
+
+[[types.lifecycle.edges]]
+from = "accepted"
+to = "in-progress"
+
+[[types.lifecycle.edges]]
+from = "in-progress"
+to = "complete"
+
+[[types.lifecycle.edges]]
+from = "*"
+to = "superseded"
+
+[naming]
+pattern = "{type}-{n:03}-{title}.md"
+
+[templates]
+dir = ".lazyspec/templates"
+
+[[relationships]]
+name = "implements"
+inverse = "implemented-by"
+traversal = "chain"
+
+[[relationships]]
+name = "supersedes"
+inverse = "superseded-by"
+
+[[relationships]]
+name = "blocks"
+inverse = "blocked-by"
+
+[[relationships]]
+name = "related-to"
+traversal = "related"
+
+[tui]
+ascii_diagrams = false
+
+[tui.statusbar]
+enabled = true
+
+[tui.multiline]
+max_expanded_height = 5
+
+[tui.graph]
+columns = [
+    "status",
+    "related",
+]
+sort = "path"
+
+[[rules]]
+shape = "relation-existence"
+name = "iterations-need-work"
+type = "iteration"
+require = "any-relation"
+severity = "error"
+
+[[rules]]
+shape = "relation-existence"
+name = "adrs-need-relations"
+type = "adr"
+require = "any-relation"
+severity = "error"
+
+[certification]
+normalize = true
+
+[certification.overrides]
+
+[agents]
+
+[skills]
+entry = "lazy"
