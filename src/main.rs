@@ -7,6 +7,8 @@ mod dispatch;
 mod init;
 mod mapping;
 #[allow(dead_code)]
+mod prompt;
+#[allow(dead_code)]
 mod store;
 #[allow(dead_code)]
 mod tracker;

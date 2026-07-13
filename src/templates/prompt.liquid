@@ -9,7 +9,12 @@ Execute it to completion in this working tree.
 ## Parent {{ parent.type }}: {{ parent.title }} ({{ parent.id }})
 
 {{ parent.body }}
+{% if attempt > 1 %}
+## Retry (attempt {{ attempt }})
 
+A previous attempt did not complete. Inspect the working tree for partial progress
+before continuing, and address whatever blocked the earlier run.
+{% endif %}
 Carry out the iteration's tasks and satisfy its acceptance criteria. Keep your
 work bounded to what this iteration describes. When the acceptance criteria are
 met, stop.

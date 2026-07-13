@@ -34,10 +34,24 @@ pub enum DependencyKind {
     Blocks,
 }
 
+/// The context of a single document as fetched by `lazyspec show <id> --json`,
+/// used to enrich a prompt with a candidate's immediate parent (ADR-006).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocView {
+    pub id: String,
+    pub doc_type: String,
+    pub title: String,
+    pub body: String,
+}
+
 /// The work-source seam. lazyspec is the only implementation today; the SPEC's
 /// tracker-adapter shape is preserved so other trackers remain future adapters.
 pub trait Tracker {
     fn fetch_dispatchable(&self) -> Result<Vec<Candidate>, TrackerError>;
+
+    /// Fetch one document's context (`lazyspec show <id> --json`) — the seam the
+    /// prompt assembler uses to pull an iteration's immediate parent.
+    fn fetch_doc(&self, id: &str) -> Result<DocView, TrackerError>;
 
     /// Move a document to `target_state` through lazyspec's gated lifecycle
     /// (the daemon owns transitions, per ADR-003). Modelled as
@@ -107,6 +121,11 @@ impl<R: CommandRunner> Tracker for LazyspecTracker<R> {
             candidate.body = parse_body(&shown)?;
         }
         Ok(candidates)
+    }
+
+    fn fetch_doc(&self, id: &str) -> Result<DocView, TrackerError> {
+        let shown = self.runner.run(&["show", id, "--json"])?;
+        parse_doc_view(id, &shown)
     }
 
     fn advance(&self, id: &str, target_state: &str) -> Result<(), TrackerError> {
@@ -182,6 +201,16 @@ fn parse_body(json: &[u8]) -> Result<String, TrackerError> {
     Ok(shown.body)
 }
 
+fn parse_doc_view(id: &str, json: &[u8]) -> Result<DocView, TrackerError> {
+    let shown: ShownDoc = serde_json::from_slice(json).map_err(TrackerError::Parse)?;
+    Ok(DocView {
+        id: id.to_string(),
+        doc_type: shown.doc_type,
+        title: shown.title,
+        body: shown.body,
+    })
+}
+
 #[derive(Deserialize)]
 struct StatusListing {
     documents: Vec<RawDoc>,
@@ -208,6 +237,10 @@ struct RawRelation {
 
 #[derive(Deserialize)]
 struct ShownDoc {
+    #[serde(default)]
+    title: String,
+    #[serde(rename = "type", default)]
+    doc_type: String,
     #[serde(default)]
     body: String,
 }
@@ -375,6 +408,33 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn fetch_doc_parses_type_title_and_body_for_a_parent() {
+        let tracker = LazyspecTracker::new(
+            FakeCli::ok(r#"{"documents":[]}"#).with_body(
+                "STORY-028",
+                r#"{"id":"STORY-028","type":"story","title":"Assemble prompt","body":"As an operator..."}"#,
+            ),
+            RoleMapping::adr003_default(),
+        );
+
+        let doc = tracker.fetch_doc("STORY-028").unwrap();
+
+        assert_eq!(doc.id, "STORY-028");
+        assert_eq!(doc.doc_type, "story");
+        assert_eq!(doc.title, "Assemble prompt");
+        assert_eq!(doc.body, "As an operator...");
+    }
+
+    #[test]
+    fn fetch_doc_surfaces_a_non_zero_exit_as_a_typed_error() {
+        let tracker = LazyspecTracker::new(RecordingCli::new(true), RoleMapping::adr003_default());
+
+        let err = tracker.fetch_doc("STORY-028").unwrap_err();
+
+        assert!(matches!(err, TrackerError::Command { .. }), "{err}");
     }
 
     #[test]

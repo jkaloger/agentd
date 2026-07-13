@@ -1,7 +1,7 @@
 ---
 title: Assemble prompt from iteration plus parent context
 type: story
-status: draft
+status: in-progress
 author: Jack Kaloger
 date: 2026-07-13
 tags: []
