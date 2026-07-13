@@ -5,6 +5,8 @@ mod daemon;
 mod init;
 mod mapping;
 #[allow(dead_code)]
+mod store;
+#[allow(dead_code)]
 mod tracker;
 
 /// agentd — a git-like daemon that orchestrates coding agents against a lazyspec backlog.
