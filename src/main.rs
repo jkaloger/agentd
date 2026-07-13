@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 
+mod config;
 mod init;
 
 /// agentd — a git-like daemon that orchestrates coding agents against a lazyspec backlog.
@@ -54,6 +55,7 @@ impl Command {
 fn run(command: Command) -> Result<(), String> {
     match command {
         Command::Init => run_init(),
+        Command::Config => run_config(),
         other => {
             println!("unimplemented: {}", other.name());
             Ok(())
@@ -86,6 +88,24 @@ fn run_init() -> Result<(), String> {
             "failed to initialize agentd store in {}: {e}",
             root.display()
         )),
+    }
+}
+
+fn run_config() -> Result<(), String> {
+    let path = std::env::current_dir()
+        .map_err(|e| format!("cannot determine current directory: {e}"))?
+        .join(init::STORE_DIR)
+        .join("config.toml");
+    if !path.exists() {
+        println!("agentd is not initialized (no {})", path.display());
+        return Ok(());
+    }
+    match config::load(&path) {
+        Ok(cfg) => {
+            println!("{cfg:#?}");
+            Ok(())
+        }
+        Err(e) => Err(format!("{e}")),
     }
 }
 
