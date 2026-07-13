@@ -88,6 +88,18 @@ impl Store {
             None => Ok(None),
         }
     }
+
+    /// Drop any claim on `id`, freeing it for a later attempt. Idempotent: a
+    /// missing claim is not an error.
+    pub fn release(&self, id: &str) -> Result<(), StoreError> {
+        let txn = self.db.begin_write().map_err(storage)?;
+        {
+            let mut table = txn.open_table(CLAIMS).map_err(storage)?;
+            table.remove(id).map_err(storage)?;
+        }
+        txn.commit().map_err(storage)?;
+        Ok(())
+    }
 }
 
 fn storage(e: impl Into<redb::Error>) -> StoreError {
@@ -178,6 +190,28 @@ mod tests {
 
         assert_eq!(second.holder, "agent-b");
         assert_eq!(store.get("ITER-007").unwrap(), Some(second));
+    }
+
+    #[test]
+    fn release_drops_the_claim_and_frees_it_for_a_live_reclaim() {
+        let dir = TempDir::new().unwrap();
+        let store = open(&dir);
+
+        store.claim("ITER-007", "agent-a", 1000, TTL).unwrap();
+        store.release("ITER-007").unwrap();
+        assert_eq!(store.get("ITER-007").unwrap(), None);
+
+        let reclaimed = store.claim("ITER-007", "agent-b", 2000, TTL).unwrap();
+        assert_eq!(reclaimed.holder, "agent-b");
+    }
+
+    #[test]
+    fn release_of_an_unclaimed_id_is_a_no_op() {
+        let dir = TempDir::new().unwrap();
+        let store = open(&dir);
+
+        store.release("ITER-007").unwrap();
+        assert_eq!(store.get("ITER-007").unwrap(), None);
     }
 
     #[test]

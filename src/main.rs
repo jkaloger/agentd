@@ -2,6 +2,8 @@ use clap::{Parser, Subcommand};
 
 mod config;
 mod daemon;
+#[allow(dead_code)]
+mod dispatch;
 mod init;
 mod mapping;
 #[allow(dead_code)]

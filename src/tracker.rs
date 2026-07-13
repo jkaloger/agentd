@@ -38,6 +38,11 @@ pub enum DependencyKind {
 /// tracker-adapter shape is preserved so other trackers remain future adapters.
 pub trait Tracker {
     fn fetch_dispatchable(&self) -> Result<Vec<Candidate>, TrackerError>;
+
+    /// Move a document to `target_state` through lazyspec's gated lifecycle
+    /// (the daemon owns transitions, per ADR-003). Modelled as
+    /// `lazyspec update <id> --status <target>`.
+    fn advance(&self, id: &str, target_state: &str) -> Result<(), TrackerError>;
 }
 
 /// Runs one lazyspec subcommand and returns its stdout, or a typed failure.
@@ -102,6 +107,11 @@ impl<R: CommandRunner> Tracker for LazyspecTracker<R> {
             candidate.body = parse_body(&shown)?;
         }
         Ok(candidates)
+    }
+
+    fn advance(&self, id: &str, target_state: &str) -> Result<(), TrackerError> {
+        self.runner.run(&["update", id, "--status", target_state])?;
+        Ok(())
     }
 }
 
@@ -391,6 +401,58 @@ mod tests {
     fn malformed_json_yields_a_typed_error() {
         let err = parse_and_filter(b"not json at all", &RoleMapping::adr003_default()).unwrap_err();
         assert!(matches!(err, TrackerError::Parse(_)), "{err}");
+    }
+
+    struct RecordingCli {
+        calls: std::cell::RefCell<Vec<String>>,
+        fail: bool,
+    }
+
+    impl RecordingCli {
+        fn new(fail: bool) -> Self {
+            RecordingCli {
+                calls: std::cell::RefCell::new(Vec::new()),
+                fail,
+            }
+        }
+    }
+
+    impl CommandRunner for RecordingCli {
+        fn run(&self, args: &[&str]) -> Result<Vec<u8>, CliFailure> {
+            self.calls.borrow_mut().push(args.join(" "));
+            if self.fail {
+                Err(CliFailure::Exit {
+                    code: Some(1),
+                    stderr: "gate rejected".to_string(),
+                })
+            } else {
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    #[test]
+    fn advance_issues_update_with_the_target_status() {
+        let tracker = LazyspecTracker::new(RecordingCli::new(false), RoleMapping::adr003_default());
+
+        tracker.advance("ITERATION-008", "in-progress").unwrap();
+
+        assert_eq!(
+            tracker.runner.calls.borrow().as_slice(),
+            ["update ITERATION-008 --status in-progress".to_string()]
+        );
+    }
+
+    #[test]
+    fn advance_failure_is_a_typed_command_error() {
+        let tracker = LazyspecTracker::new(RecordingCli::new(true), RoleMapping::adr003_default());
+
+        let err = tracker.advance("ITERATION-008", "in-progress").unwrap_err();
+
+        assert!(
+            matches!(err, TrackerError::Command { code: Some(1), .. }),
+            "{err}"
+        );
     }
 
     #[test]
