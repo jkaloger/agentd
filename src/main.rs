@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 
 mod config;
+mod daemon;
 mod init;
 
 /// agentd — a git-like daemon that orchestrates coding agents against a lazyspec backlog.
@@ -52,15 +53,70 @@ impl Command {
     }
 }
 
-fn run(command: Command) -> Result<(), String> {
+async fn run(command: Command) -> Result<(), String> {
     match command {
         Command::Init => run_init(),
         Command::Config => run_config(),
+        Command::Start => run_start().await,
+        Command::Status => run_status().await,
+        Command::Stop => run_stop().await,
         other => {
             println!("unimplemented: {}", other.name());
             Ok(())
         }
     }
+}
+
+fn store_dir() -> Result<std::path::PathBuf, String> {
+    std::env::current_dir()
+        .map(|cwd| cwd.join(init::STORE_DIR))
+        .map_err(|e| format!("cannot determine current directory: {e}"))
+}
+
+async fn run_start() -> Result<(), String> {
+    let store = store_dir()?;
+    let config_path = store.join("config.toml");
+    let socket_path = store.join("agentd.sock");
+
+    let daemon = daemon::start(&config_path, &socket_path)
+        .await
+        .map_err(|e| e.to_string())?;
+    println!(
+        "agentd started (socket {}, {} worker(s))",
+        socket_path.display(),
+        daemon.workers_spawned()
+    );
+
+    daemon.wait().await;
+    daemon.shutdown().await;
+    println!("agentd stopped");
+    Ok(())
+}
+
+async fn run_status() -> Result<(), String> {
+    let socket_path = store_dir()?.join("agentd.sock");
+    let items = daemon::query_status(&socket_path)
+        .await
+        .map_err(|e| e.to_string())?;
+    if items.is_empty() {
+        println!("no running items");
+    }
+    for item in items {
+        println!(
+            "{}\t{}\t{}\tstarted_at={}",
+            item.id, item.state, item.identifier, item.started_at_ms
+        );
+    }
+    Ok(())
+}
+
+async fn run_stop() -> Result<(), String> {
+    let socket_path = store_dir()?.join("agentd.sock");
+    daemon::send_shutdown(&socket_path)
+        .await
+        .map_err(|e| e.to_string())?;
+    println!("stop signal sent");
+    Ok(())
 }
 
 fn run_init() -> Result<(), String> {
@@ -112,7 +168,7 @@ fn run_config() -> Result<(), String> {
 #[tokio::main]
 async fn main() -> Result<(), String> {
     let cli = Cli::parse();
-    run(cli.command)
+    run(cli.command).await
 }
 
 #[cfg(test)]
@@ -125,8 +181,8 @@ mod tests {
         Cli::command().debug_assert();
     }
 
-    #[test]
-    fn parses_every_porcelain_subcommand() {
+    #[tokio::test]
+    async fn parses_every_porcelain_subcommand() {
         let cases: &[&[&str]] = &[
             &["agentd", "init"],
             &["agentd", "start"],
@@ -143,8 +199,11 @@ mod tests {
         for args in cases {
             let cli = Cli::try_parse_from(*args)
                 .unwrap_or_else(|e| panic!("failed to parse {args:?}: {e}"));
-            if !matches!(cli.command, Command::Init) {
-                run(cli.command).unwrap();
+            if !matches!(
+                cli.command,
+                Command::Init | Command::Start | Command::Stop | Command::Status
+            ) {
+                run(cli.command).await.unwrap();
             }
         }
     }

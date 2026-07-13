@@ -1,7 +1,7 @@
 ---
 title: Boot and pick up one item
 type: iteration
-status: draft
+status: complete
 author: Jack Kaloger
 date: 2026-07-13
 tags: []
