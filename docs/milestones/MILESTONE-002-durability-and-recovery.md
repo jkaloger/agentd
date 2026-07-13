@@ -1,7 +1,7 @@
 ---
 title: "Durability and recovery"
 type: milestone
-status: planned
+status: active
 author: "Jack Kaloger"
 date: 2026-07-13
 tags: []
