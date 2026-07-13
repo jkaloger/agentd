@@ -1,7 +1,7 @@
 ---
 title: Reclaim an expired lease
 type: story
-status: accepted
+status: in-progress
 author: Jack Kaloger
 date: 2026-07-13
 tags: []

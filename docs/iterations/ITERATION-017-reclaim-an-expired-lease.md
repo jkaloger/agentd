@@ -1,7 +1,7 @@
 ---
 title: Reclaim an expired lease
 type: iteration
-status: accepted
+status: complete
 author: Jack Kaloger
 date: 2026-07-13
 tags: []

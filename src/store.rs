@@ -70,18 +70,20 @@ impl Store {
         let record = {
             let mut table = txn.open_table(CLAIMS).map_err(claim_storage)?;
 
+            let mut fence = 1;
             if let Some(existing) = table.get(id).map_err(claim_storage)? {
                 let existing: ClaimRecord =
                     serde_json::from_slice(existing.value()).map_err(ClaimError::Encode)?;
                 if existing.due_at > now {
                     return Err(ClaimError::AlreadyClaimed(existing));
                 }
+                fence = existing.fence + 1;
             }
 
             let record = ClaimRecord {
                 holder: holder.to_string(),
                 due_at: now + lease_ttl.as_millis() as u64,
-                fence: 1,
+                fence,
             };
             let bytes = serde_json::to_vec(&record).map_err(ClaimError::Encode)?;
             table.insert(id, bytes.as_slice()).map_err(claim_storage)?;
@@ -263,6 +265,54 @@ mod tests {
 
         assert_eq!(second.holder, "agent-b");
         assert_eq!(store.get("ITER-007").unwrap(), Some(second));
+    }
+
+    #[test]
+    fn reclaim_of_an_expired_lease_bumps_the_fence() {
+        let dir = TempDir::new().unwrap();
+        let store = open(&dir);
+
+        let first = store.claim("ITER-007", "agent-a", 1000, TTL).unwrap();
+        let now = first.due_at + 1;
+        let second = store.claim("ITER-007", "agent-b", now, TTL).unwrap();
+
+        assert_eq!(second.holder, "agent-b");
+        assert_eq!(second.fence, first.fence + 1);
+        assert_eq!(second.due_at, now + 60_000);
+        assert_eq!(store.get("ITER-007").unwrap(), Some(second));
+    }
+
+    #[test]
+    fn a_heartbeat_from_the_prior_holders_fence_is_rejected_after_reclaim() {
+        let dir = TempDir::new().unwrap();
+        let store = open(&dir);
+
+        let first = store.claim("ITER-007", "agent-a", 1000, TTL).unwrap();
+        let now = first.due_at + 1;
+        store.claim("ITER-007", "agent-b", now, TTL).unwrap();
+
+        let err = store
+            .heartbeat("ITER-007", "agent-a", first.fence, now + 1, TTL)
+            .expect_err("a heartbeat carrying the prior holder's stale fence must be rejected");
+        match err {
+            HeartbeatError::Mismatch(_) => {}
+            other => panic!("expected Mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fence_strictly_increases_across_successive_reclaims_of_the_same_id() {
+        let dir = TempDir::new().unwrap();
+        let store = open(&dir);
+
+        let mut now = 1000;
+        let mut last = 0;
+        for i in 0..5 {
+            let record = store.claim("ITER-007", &format!("agent-{i}"), now, TTL).unwrap();
+            assert!(record.fence > last, "fence must strictly increase");
+            last = record.fence;
+            now = record.due_at + 1;
+        }
     }
 
     #[test]
