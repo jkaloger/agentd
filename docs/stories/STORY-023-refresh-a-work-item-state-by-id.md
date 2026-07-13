@@ -7,6 +7,7 @@ date: 2026-07-13
 tags: []
 related:
 - related-to: ADR-003
+- targets: MILESTONE-003
 ---
 
 As an operator, I want the daemon to re-read a specific item state via `lazyspec show <id> --json`, so that in-flight work is stopped/released when its state changes.

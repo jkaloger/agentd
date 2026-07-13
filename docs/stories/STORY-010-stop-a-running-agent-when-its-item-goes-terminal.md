@@ -7,6 +7,8 @@ date: 2026-07-13
 tags: []
 related:
 - related-to: ADR-001
+- blocks: STORY-011
+- targets: MILESTONE-003
 ---
 
 As a backlog owner, I want the daemon to stop an agent whose item was closed under it, so that no effort is wasted on abandoned work.

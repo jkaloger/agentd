@@ -7,6 +7,8 @@ date: 2026-07-13
 tags: []
 related:
 - related-to: ADR-004
+- blocks: STORY-038
+- targets: MILESTONE-004
 ---
 
 As an integrator, I want a config-driven generic-subprocess adapter (command, args, cwd) emitting canonical events, so that I can point agentd at a simple new agent without a bespoke adapter.

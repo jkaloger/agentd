@@ -7,6 +7,8 @@ date: 2026-07-13
 tags: []
 related:
 - related-to: ADR-002
+- blocks: STORY-053
+- targets: MILESTONE-002
 ---
 
 As an operator, I want current claim/lease state projected to .agentd/state.json and refs/claims/<iter-id>, so that I can jq the live picture and inspect per-iteration status offline, git-style.

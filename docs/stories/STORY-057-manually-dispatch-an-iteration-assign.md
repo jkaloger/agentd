@@ -7,6 +7,7 @@ date: 2026-07-13
 tags: []
 related:
 - related-to: ADR-006
+- targets: MILESTONE-005
 ---
 
 As an operator, I want `agentd assign <iter-id>` to prioritize dispatching a specific iteration through the daemon, so that I can jump a ticket ahead without becoming a second claimant.

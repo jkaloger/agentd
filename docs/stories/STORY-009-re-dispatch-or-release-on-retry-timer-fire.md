@@ -7,6 +7,7 @@ date: 2026-07-13
 tags: []
 related:
 - related-to: ADR-001
+- targets: MILESTONE-003
 ---
 
 As a backlog owner, I want a fired retry to re-check the backlog before acting, so that stale or completed work is not relaunched.

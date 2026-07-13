@@ -7,6 +7,8 @@ date: 2026-07-13
 tags: []
 related:
 - related-to: ADR-003
+- blocks: STORY-022
+- targets: MILESTONE-001
 ---
 
 As an operator, I want to declare in config which lazyspec type(s) are dispatchable and how states map to dispatch/active/terminal roles, so that agentd works with my document shape, not just the iteration default.

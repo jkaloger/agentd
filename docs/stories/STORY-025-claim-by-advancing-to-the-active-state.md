@@ -7,6 +7,9 @@ date: 2026-07-13
 tags: []
 related:
 - related-to: ADR-003
+- blocks: STORY-026
+- blocks: STORY-060
+- targets: MILESTONE-001
 ---
 
 As an operator, I want the daemon to advance a claimed item from dispatch to active via `lazyspec advance` at claim time, so that the backlog reflects work in progress and it is not picked up twice. (Write walking skeleton; daemon owns transitions.)

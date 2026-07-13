@@ -7,6 +7,8 @@ date: 2026-07-13
 tags: []
 related:
 - related-to: ADR-006
+- blocks: STORY-047
+- targets: MILESTONE-001
 ---
 
 As an operator, I want `agentd init` to scaffold a .agentd/ store beside my .lazyspec.toml, so that I have a versionable home for policy before running anything.

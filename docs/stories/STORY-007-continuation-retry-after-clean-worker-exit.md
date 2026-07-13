@@ -7,6 +7,8 @@ date: 2026-07-13
 tags: []
 related:
 - related-to: ADR-001
+- blocks: STORY-008
+- targets: MILESTONE-003
 ---
 
 As a backlog owner, I want an item a worker finished cleanly to be re-checked shortly after, so that still-active work continues in a fresh session.

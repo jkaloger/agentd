@@ -7,6 +7,10 @@ date: 2026-07-13
 tags: []
 related:
 - related-to: ADR-004
+- blocks: STORY-029
+- blocks: STORY-036
+- blocks: STORY-021
+- targets: MILESTONE-001
 ---
 
 As an integrator, I want the Claude adapter to translate stream-json into the canonical AgentEvent model, so that the orchestrator only ever sees protocol-agnostic events.

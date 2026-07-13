@@ -6,7 +6,9 @@ author: Jack Kaloger
 date: 2026-07-13
 tags: []
 related:
-- related-to: ADR-001
+- related-to: ADR-007
+- blocks: STORY-006
+- targets: MILESTONE-003
 ---
 
 As an operator, I want a hard ceiling on concurrent agents, so that the host is not overwhelmed.

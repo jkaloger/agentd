@@ -7,6 +7,7 @@ date: 2026-07-13
 tags: []
 related:
 - related-to: ADR-005
+- targets: MILESTONE-006
 ---
 
 As an operator, I want worktrees for terminal iterations cleaned up, so that stale trees and branches do not accumulate.

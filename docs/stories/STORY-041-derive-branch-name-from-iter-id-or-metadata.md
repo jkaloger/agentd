@@ -7,6 +7,7 @@ date: 2026-07-13
 tags: []
 related:
 - related-to: ADR-005
+- targets: MILESTONE-006
 ---
 
 As an operator, I want the worktree branch to follow a predictable scheme, preferring lazyspec branch metadata, so that branches map cleanly to tickets and PRs.

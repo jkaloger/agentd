@@ -7,9 +7,7 @@ date: 2026-07-12
 tags: []
 related:
 - related-to: ADR-002
----
-
-## Context
+---## Context
 
 agentd is a unix, git-like daemon that orchestrates coding agents against a lazyspec
 backlog. It is modelled on the Symphony service spec (`SPEC.md`) but must feel like a
@@ -37,6 +35,11 @@ queries route through the daemon over the socket; offline inspection reads the p
 (see [[adr-002-durable-state-and-leasing]]). Concurrency uses tokio; per-ticket workers are
 supervised by the orchestrator task.
 
+The **unix socket is the only control-plane surface**: SPEC §13.7's optional HTTP server /
+dashboard is **declined**. Programmatic access is served by machine-readable CLI output over
+the socket (SPEC §13.7 `/api` parity is met by `agentd show --json` etc.), keeping a single
+authenticated, filesystem-permissioned channel rather than a second network listener.
+
 ## Consequences
 
 - Single artifact, instant CLI, strong compile-time guarantees on the lease/state machine.
@@ -45,6 +48,7 @@ supervised by the orchestrator task.
 - Long-lived agent subprocesses are handled directly rather than through a Port abstraction.
 - The socket control plane is idiomatic (`/var/run`-style), but live state requires the daemon;
   offline inspectability is delivered by the text projection in [[adr-002-durable-state-and-leasing]].
+- No HTTP surface to secure or operate; access control reduces to socket file permissions, and
+  scripting goes through the same porcelain a human uses.
 - Diverges from Symphony's language-agnostic framing by committing to Rust; the abstraction
   layers of SPEC §3.2 are preserved as Rust module boundaries.
-

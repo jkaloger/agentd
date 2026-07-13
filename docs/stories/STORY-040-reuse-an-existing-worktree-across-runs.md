@@ -7,6 +7,7 @@ date: 2026-07-13
 tags: []
 related:
 - related-to: ADR-005
+- targets: MILESTONE-006
 ---
 
 As an operator, I want a retry/continuation of the same iteration to reuse its worktree, so that prior work persists across attempts.

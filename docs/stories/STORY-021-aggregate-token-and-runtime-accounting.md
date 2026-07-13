@@ -7,6 +7,8 @@ date: 2026-07-13
 tags: []
 related:
 - related-to: ADR-002
+- blocks: STORY-053
+- targets: MILESTONE-004
 ---
 
 As an operator, I want per-iteration and aggregate token/runtime totals accumulated durably from canonical agent events, so that cost and runtime survive restarts and appear in status.

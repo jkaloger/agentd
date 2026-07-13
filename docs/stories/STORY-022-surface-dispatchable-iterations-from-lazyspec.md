@@ -7,6 +7,11 @@ date: 2026-07-13
 tags: []
 related:
 - related-to: ADR-003
+- blocks: STORY-023
+- blocks: STORY-025
+- blocks: STORY-061
+- blocks: STORY-060
+- targets: MILESTONE-001
 ---
 
 As an operator, I want the daemon to read dispatch-eligible iterations via `lazyspec status --json`, so that work marked ready is discovered automatically. (Read walking skeleton behind a Tracker trait.)

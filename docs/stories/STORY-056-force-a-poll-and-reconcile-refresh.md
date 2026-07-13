@@ -7,6 +7,7 @@ date: 2026-07-13
 tags: []
 related:
 - related-to: ADR-006
+- targets: MILESTONE-005
 ---
 
 As an operator, I want `agentd refresh` to trigger an immediate poll + reconcile, so that I do not wait for the next interval after editing the backlog.

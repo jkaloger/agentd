@@ -7,6 +7,7 @@ date: 2026-07-13
 tags: []
 related:
 - related-to: ADR-003
+- targets: MILESTONE-003
 ---
 
 As an operator, I want the daemon to detect when `lazyspec advance` is refused by a lifecycle gate and surface it without corrupting claim state, so that I can see why an item is stuck.

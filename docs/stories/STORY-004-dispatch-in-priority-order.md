@@ -6,7 +6,8 @@ author: Jack Kaloger
 date: 2026-07-13
 tags: []
 related:
-- related-to: ADR-001
+- related-to: ADR-007
+- targets: MILESTONE-003
 ---
 
 As a backlog owner, I want the most important item dispatched first when slots are scarce, so that high-priority work is not starved.

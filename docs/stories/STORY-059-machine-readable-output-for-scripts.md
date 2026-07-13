@@ -7,6 +7,7 @@ date: 2026-07-13
 tags: []
 related:
 - related-to: ADR-006
+- targets: MILESTONE-005
 ---
 
 As automation, I want every read/query verb to offer machine-readable output whose values match the human view, so that I can script agentd without scraping text.

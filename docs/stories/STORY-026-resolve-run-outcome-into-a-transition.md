@@ -7,6 +7,8 @@ date: 2026-07-13
 tags: []
 related:
 - related-to: ADR-003
+- blocks: STORY-027
+- targets: MILESTONE-001
 ---
 
 As an operator, I want the daemon to advance a finished item to terminal on success and back/rejected on failure using the agent outcome, so that the lifecycle tracks reality with no drift.

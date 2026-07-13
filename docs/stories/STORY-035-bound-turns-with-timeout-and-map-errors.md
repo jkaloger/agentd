@@ -7,6 +7,7 @@ date: 2026-07-13
 tags: []
 related:
 - related-to: ADR-004
+- targets: MILESTONE-004
 ---
 
 As an operator, I want long-running or process-level failures terminated and classified, so that the daemon gets a precise failure reason for retry and logs.

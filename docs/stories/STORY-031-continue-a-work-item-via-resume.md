@@ -7,6 +7,7 @@ date: 2026-07-13
 tags: []
 related:
 - related-to: ADR-004
+- targets: MILESTONE-004
 ---
 
 As an operator, I want an item that stays active continued on the same Claude session via `claude -p --resume <id>`, so that follow-up turns keep prior context.

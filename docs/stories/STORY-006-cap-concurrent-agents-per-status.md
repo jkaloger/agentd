@@ -6,7 +6,8 @@ author: Jack Kaloger
 date: 2026-07-13
 tags: []
 related:
-- related-to: ADR-001
+- related-to: ADR-007
+- targets: MILESTONE-003
 ---
 
 As an operator, I want per-status concurrency caps, so that I can limit agents in an expensive phase independently of the global cap.

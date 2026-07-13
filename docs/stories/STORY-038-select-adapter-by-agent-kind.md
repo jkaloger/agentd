@@ -7,6 +7,7 @@ date: 2026-07-13
 tags: []
 related:
 - related-to: ADR-004
+- targets: MILESTONE-004
 ---
 
 As an operator, I want to choose the adapter via `agent.kind` in config, so that the same daemon can drive Claude (or later codex/opencode) without code changes.

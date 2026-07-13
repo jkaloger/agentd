@@ -8,9 +8,7 @@ tags: []
 related:
 - related-to: ADR-003
 - related-to: ADR-002
----
-
-## Context
+---## Context
 
 Symphony hardwires the Codex app-server protocol (thread/turn, streaming JSON over stdio,
 `session_id = <thread_id>-<turn_id>`, token-usage events — SPEC §10). agentd must target
@@ -39,6 +37,11 @@ loops to the goal internally, so Symphony's multi-turn app-server loop largely c
 one agentic run per iteration, with re-dispatch only if the doc is still active). The TS/Python
 Agent SDK is rejected — it would break the single-binary story.
 
+`agent.max_turns` (SPEC §5.3.5, §7.1, §16.5) remains a configured bound on the in-worker
+continuation loop. For the one-shot claude adapter it is effectively 1-plus-redispatch; a
+future persistent adapter (codex) enforces it as a real per-session turn ceiling. The field is
+parsed and defaulted by the config loader regardless of adapter.
+
 Default posture is **high-trust / non-interactive**: auto-approve commands and edits, and treat
 `input-required` as failure rather than blocking (SPEC §10.5 high-trust example). The user need
 not interact with the agent. This posture MUST stay **configurable** — a stricter
@@ -57,4 +60,3 @@ operator-approval mode is possible even though the default is autonomous.
 - The adapter's clean-exit vs failure signal feeds the daemon's lifecycle transition
   ([[adr-003-work-source-lazyspec]]); token/runtime usage feeds the store
   ([[adr-002-durable-state-and-leasing]]).
-

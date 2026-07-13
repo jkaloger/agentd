@@ -7,6 +7,7 @@ date: 2026-07-13
 tags: []
 related:
 - related-to: ADR-005
+- targets: MILESTONE-006
 ---
 
 As an operator, I want the daemon to refuse launch unless the workspace path is sanitized, inside the root, and the agents cwd, so that a malformed iter-id can never target an arbitrary directory.

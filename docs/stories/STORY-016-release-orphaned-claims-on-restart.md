@@ -7,6 +7,9 @@ date: 2026-07-13
 tags: []
 related:
 - related-to: ADR-002
+- blocks: STORY-017
+- blocks: STORY-065
+- targets: MILESTONE-002
 ---
 
 As an operator, I want the daemon at startup to release claims whose lease expired with no live worker, so that after a crash the backlog is not blocked by ghost claims.

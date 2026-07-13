@@ -7,6 +7,7 @@ date: 2026-07-13
 tags: []
 related:
 - related-to: ADR-001
+- targets: MILESTONE-003
 ---
 
 As an operator, I want agents that stop making progress killed and retried, so that a hung agent does not hold a slot forever.

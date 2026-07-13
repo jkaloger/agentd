@@ -7,6 +7,7 @@ date: 2026-07-13
 tags: []
 related:
 - related-to: ADR-006
+- targets: MILESTONE-005
 ---
 
 As an operator, I want `agentd cancel <iter-id>` to stop a running agent via the daemon, so that I can pull the plug on misbehaving work.

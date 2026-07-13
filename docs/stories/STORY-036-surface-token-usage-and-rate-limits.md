@@ -7,6 +7,8 @@ date: 2026-07-13
 tags: []
 related:
 - related-to: ADR-004
+- blocks: STORY-021
+- targets: MILESTONE-004
 ---
 
 As an operator, I want the adapter to extract token counts and the latest rate-limit snapshot from the stream, so that cost and throttling are visible and recorded.

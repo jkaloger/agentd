@@ -7,6 +7,7 @@ date: 2026-07-13
 tags: []
 related:
 - related-to: ADR-001
+- targets: MILESTONE-003
 ---
 
 As a backlog owner, I want the daemon to re-poll on a fixed interval, so that work added later is picked up without a restart.

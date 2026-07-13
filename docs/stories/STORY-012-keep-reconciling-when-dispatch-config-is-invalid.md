@@ -7,6 +7,7 @@ date: 2026-07-13
 tags: []
 related:
 - related-to: ADR-001
+- targets: MILESTONE-003
 ---
 
 As an operator, I want a bad config to pause new dispatch without freezing safety reconciliation, so that a typo cannot leave stale agents running while blocking recovery.

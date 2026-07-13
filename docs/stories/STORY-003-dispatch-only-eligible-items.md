@@ -7,6 +7,11 @@ date: 2026-07-13
 tags: []
 related:
 - related-to: ADR-001
+- blocks: STORY-061
+- blocks: STORY-004
+- blocks: STORY-005
+- blocks: STORY-064
+- targets: MILESTONE-003
 ---
 
 As a backlog owner, I want the daemon to dispatch only items passing all eligibility rules, so that agents never run on incomplete, wrong-status, or already-claimed work.

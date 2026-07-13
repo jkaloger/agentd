@@ -7,6 +7,9 @@ date: 2026-07-13
 tags: []
 related:
 - related-to: ADR-004
+- blocks: STORY-033
+- blocks: STORY-034
+- targets: MILESTONE-004
 ---
 
 As an operator, I want the Claude adapter to run fully non-interactively, auto-approving command and file-change requests, so that work completes unattended.

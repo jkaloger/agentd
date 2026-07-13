@@ -7,6 +7,7 @@ date: 2026-07-13
 tags: []
 related:
 - related-to: ADR-002
+- targets: MILESTONE-002
 ---
 
 As a developer, I want an iteration whose lease expired to become claimable again, so that a crashed worker resumes instead of stalling forever.

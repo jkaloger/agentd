@@ -7,6 +7,13 @@ date: 2026-07-13
 tags: []
 related:
 - related-to: ADR-001
+- blocks: STORY-002
+- blocks: STORY-003
+- blocks: STORY-007
+- blocks: STORY-010
+- blocks: STORY-012
+- blocks: STORY-060
+- targets: MILESTONE-001
 ---
 
 As an operator, I want to start agentd and have it pick up a single eligible iteration and run an agent on it, so that work begins without hand-scripting. (Walking skeleton: stubbed store/adapter/workspace.)

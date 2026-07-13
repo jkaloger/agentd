@@ -7,6 +7,8 @@ date: 2026-07-13
 tags: []
 related:
 - related-to: ADR-006
+- blocks: STORY-059
+- targets: MILESTONE-005
 ---
 
 As an operator, I want `agentd status` to show active sessions and the retry queue, so that I can tell what the daemon is doing (git status analog).

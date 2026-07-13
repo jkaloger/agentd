@@ -7,6 +7,8 @@ date: 2026-07-13
 tags: []
 related:
 - related-to: ADR-002
+- blocks: STORY-054
+- targets: MILESTONE-002
 ---
 
 As an operator, I want every state transition appended to a plain-text .agentd/log, so that I can tail/grep full history without a running daemon.

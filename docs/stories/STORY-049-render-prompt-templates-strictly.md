@@ -7,6 +7,8 @@ date: 2026-07-13
 tags: []
 related:
 - related-to: ADR-006
+- blocks: STORY-066
+- targets: MILESTONE-005
 ---
 
 As an operator, I want prompt templates rendered strictly against iteration context, so that a variable typo fails loudly instead of shipping a broken prompt.

@@ -7,6 +7,8 @@ date: 2026-07-13
 tags: []
 related:
 - related-to: ADR-002
+- blocks: STORY-015
+- targets: MILESTONE-002
 ---
 
 As an operator, I want a running claim to carry a TTL lease the live worker renews by heartbeat, so that a healthy worker keeps its claim while a dead worker becomes reclaimable.

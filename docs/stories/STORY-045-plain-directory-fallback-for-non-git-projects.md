@@ -7,6 +7,7 @@ date: 2026-07-13
 tags: []
 related:
 - related-to: ADR-005
+- targets: MILESTONE-006
 ---
 
 As a non-git maintainer, I want a plain per-iteration directory mode when my project is not a git repo, so that I can still run agentd with isolation.

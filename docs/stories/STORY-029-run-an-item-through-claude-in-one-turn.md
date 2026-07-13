@@ -7,6 +7,12 @@ date: 2026-07-13
 tags: []
 related:
 - related-to: ADR-004
+- blocks: STORY-031
+- blocks: STORY-032
+- blocks: STORY-035
+- blocks: STORY-038
+- blocks: STORY-060
+- targets: MILESTONE-001
 ---
 
 As an operator, I want agentd to launch `claude -p` in a items worktree, run one turn to completion, and report clean exit vs failure, so that an iteration executes without me driving the agent. (Walking skeleton; keep hard-stubbed.)

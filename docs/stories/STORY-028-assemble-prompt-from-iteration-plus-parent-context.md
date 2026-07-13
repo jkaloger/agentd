@@ -7,6 +7,8 @@ date: 2026-07-13
 tags: []
 related:
 - related-to: ADR-003
+- blocks: STORY-029
+- targets: MILESTONE-001
 ---
 
 As an operator, I want the agent to receive the rendered iteration body with its parent story/bug context, so that it has the plan and surrounding intent without manual pasting. (Flagged: scope to immediate parent; transitive ancestry later.)

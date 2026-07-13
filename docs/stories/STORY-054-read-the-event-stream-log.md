@@ -7,6 +7,8 @@ date: 2026-07-13
 tags: []
 related:
 - related-to: ADR-006
+- blocks: STORY-059
+- targets: MILESTONE-005
 ---
 
 As an operator, I want `agentd log [<iter-id>]` to print the append-only event stream, so that I can audit what happened (git log/reflog analog).

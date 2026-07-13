@@ -7,6 +7,7 @@ date: 2026-07-13
 tags: []
 related:
 - related-to: ADR-002
+- targets: MILESTONE-002
 ---
 
 As a developer, I want a failed iteration retry stored with its due time and re-armed after restart, so that backoff survives crashes. (Flagged: needs a restart-stable wall-clock due_at, not monotonic.)
