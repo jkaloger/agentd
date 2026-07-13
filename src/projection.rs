@@ -11,6 +11,11 @@ use crate::store::ClaimRecord;
 /// fresh claim from a reclaim of an expired lease, and heartbeat is not wired
 /// into the daemon tick loop as of this iteration. The variants exist so
 /// those future call sites (STORY-014's heartbeat wiring) have a kind ready.
+///
+/// `RetryScheduled` and `RetryCleared` mirror the durable `retries` table
+/// (STORY-018): they are emitted once the re-dispatch loop that schedules and
+/// clears retries lands (STORY-009). The kinds exist now so that wiring has a
+/// ready projection, alongside the store ops that back them.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventKind {
@@ -19,6 +24,8 @@ pub enum EventKind {
     Release,
     Heartbeat,
     ReconcileRelease,
+    RetryScheduled,
+    RetryCleared,
 }
 
 impl fmt::Display for EventKind {
@@ -29,6 +36,8 @@ impl fmt::Display for EventKind {
             EventKind::Release => "release",
             EventKind::Heartbeat => "heartbeat",
             EventKind::ReconcileRelease => "reconcile_release",
+            EventKind::RetryScheduled => "retry_scheduled",
+            EventKind::RetryCleared => "retry_cleared",
         };
         write!(f, "{s}")
     }
@@ -209,6 +218,32 @@ mod tests {
         assert_eq!(fields["event"], "claim");
         assert_eq!(fields["holder"], "agent-a");
         assert!(contents.ends_with('\n'), "line must be newline-terminated");
+    }
+
+    #[test]
+    fn a_retry_schedule_and_clear_project_parseable_lines() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("log");
+        let projection = Projection::new(&path);
+
+        projection.record(
+            1000,
+            "ITER-019",
+            EventKind::RetryScheduled,
+            &[("attempt", "2"), ("due_at", "9000")],
+        );
+        projection.record(2000, "ITER-019", EventKind::RetryCleared, &[]);
+
+        let contents = fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 2);
+
+        let scheduled = parse_line(lines[0]);
+        assert_eq!(scheduled["event"], "retry_scheduled");
+        assert_eq!(scheduled["attempt"], "2");
+        assert_eq!(scheduled["due_at"], "9000");
+
+        assert_eq!(parse_line(lines[1])["event"], "retry_cleared");
     }
 
     #[cfg(unix)]

@@ -5,6 +5,7 @@ use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 
 const CLAIMS: TableDefinition<&str, &[u8]> = TableDefinition::new("claims");
+const RETRIES: TableDefinition<&str, &[u8]> = TableDefinition::new("retries");
 
 /// A durable claim on an iteration: who holds it, when the lease expires, and
 /// a fence that a heartbeat must present to prove it still owns that lease.
@@ -13,6 +14,20 @@ pub struct ClaimRecord {
     pub holder: String,
     pub due_at: u64,
     pub fence: u64,
+}
+
+/// A durable retry schedule for a failed iteration: which attempt this is, the
+/// error that triggered it, and when it next becomes eligible.
+///
+/// `due_at` is absolute wall-clock ms (Unix epoch), never a monotonic instant:
+/// it must outlive the process, so after a restart eligibility is re-derived by
+/// comparing the persisted `due_at` against the wall clock — no timer handle is
+/// stored (ADR-002).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetryRecord {
+    pub attempt: u32,
+    pub error: String,
+    pub due_at: u64,
 }
 
 #[derive(Debug)]
@@ -26,6 +41,7 @@ pub enum ClaimError {
 pub enum StoreError {
     Open(redb::Error),
     Storage(redb::Error),
+    Encode(serde_json::Error),
     Decode(serde_json::Error),
 }
 
@@ -50,6 +66,7 @@ impl Store {
         let db = Database::create(path).map_err(|e| StoreError::Open(e.into()))?;
         let txn = db.begin_write().map_err(storage)?;
         txn.open_table(CLAIMS).map_err(storage)?;
+        txn.open_table(RETRIES).map_err(storage)?;
         txn.commit().map_err(storage)?;
         Ok(Self { db })
     }
@@ -166,6 +183,70 @@ impl Store {
         let txn = self.db.begin_write().map_err(storage)?;
         {
             let mut table = txn.open_table(CLAIMS).map_err(storage)?;
+            table.remove(id).map_err(storage)?;
+        }
+        txn.commit().map_err(storage)?;
+        Ok(())
+    }
+
+    /// Persist (or replace) the retry schedule for `id`. `due_at` is absolute
+    /// wall-clock ms; the store just records what the caller computed. Upserts,
+    /// so a later failure for the same id overwrites the prior schedule rather
+    /// than accumulating stale entries.
+    pub fn schedule_retry(
+        &self,
+        id: &str,
+        attempt: u32,
+        error: &str,
+        due_at: u64,
+    ) -> Result<RetryRecord, StoreError> {
+        let record = RetryRecord {
+            attempt,
+            error: error.to_string(),
+            due_at,
+        };
+        let bytes = serde_json::to_vec(&record).map_err(StoreError::Encode)?;
+        let txn = self.db.begin_write().map_err(storage)?;
+        {
+            let mut table = txn.open_table(RETRIES).map_err(storage)?;
+            table.insert(id, bytes.as_slice()).map_err(storage)?;
+        }
+        txn.commit().map_err(storage)?;
+        Ok(record)
+    }
+
+    /// Every persisted retry schedule as `(id, record)`. Used on restart to
+    /// re-derive pending retries from their stored `due_at`.
+    pub fn retries(&self) -> Result<Vec<(String, RetryRecord)>, StoreError> {
+        let txn = self.db.begin_read().map_err(storage)?;
+        let table = txn.open_table(RETRIES).map_err(storage)?;
+        let mut retries = Vec::new();
+        for entry in table.iter().map_err(storage)? {
+            let (key, value) = entry.map_err(storage)?;
+            let record = serde_json::from_slice(value.value()).map_err(StoreError::Decode)?;
+            retries.push((key.value().to_string(), record));
+        }
+        Ok(retries)
+    }
+
+    /// Retry schedules eligible by `now` (absolute wall-clock ms). Eligibility
+    /// is derived purely from the stored `due_at`, so a schedule whose `due_at`
+    /// is already past when the store is reopened is returned immediately —
+    /// backoff survives a crash without any serialized timer.
+    pub fn due_retries(&self, now: u64) -> Result<Vec<(String, RetryRecord)>, StoreError> {
+        Ok(self
+            .retries()?
+            .into_iter()
+            .filter(|(_, record)| record.due_at <= now)
+            .collect())
+    }
+
+    /// Drop the retry schedule for `id` once it is re-dispatched or leaves
+    /// candidacy. Idempotent: a missing entry is not an error.
+    pub fn clear_retry(&self, id: &str) -> Result<(), StoreError> {
+        let txn = self.db.begin_write().map_err(storage)?;
+        {
+            let mut table = txn.open_table(RETRIES).map_err(storage)?;
             table.remove(id).map_err(storage)?;
         }
         txn.commit().map_err(storage)?;
@@ -450,5 +531,83 @@ mod tests {
 
         let store = Store::open(&path).unwrap();
         assert_eq!(store.get("ITER-007").unwrap(), Some(written));
+    }
+
+    #[test]
+    fn schedule_retry_persists_the_entry_and_replaces_a_prior_one_for_the_same_id() {
+        let dir = TempDir::new().unwrap();
+        let store = open(&dir);
+
+        store
+            .schedule_retry("ITER-007", 1, "boom", 5_000)
+            .unwrap();
+        let replaced = store
+            .schedule_retry("ITER-007", 2, "boom again", 9_000)
+            .unwrap();
+
+        let retries = store.retries().unwrap();
+        assert_eq!(retries.len(), 1, "the prior entry must be replaced, not appended");
+        assert_eq!(retries[0].0, "ITER-007");
+        assert_eq!(retries[0].1, replaced);
+        assert_eq!(retries[0].1.attempt, 2);
+        assert_eq!(retries[0].1.error, "boom again");
+        assert_eq!(retries[0].1.due_at, 9_000);
+    }
+
+    #[test]
+    fn a_scheduled_retry_survives_reopen_and_is_re_derived_from_due_at() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("claims.redb");
+
+        let scheduled = {
+            let store = Store::open(&path).unwrap();
+            store.schedule_retry("ITER-007", 3, "flaky", 42_000).unwrap()
+        };
+
+        let store = Store::open(&path).unwrap();
+        let retries = store.retries().unwrap();
+        assert_eq!(retries.len(), 1);
+        assert_eq!(retries[0].0, "ITER-007");
+        assert_eq!(retries[0].1, scheduled);
+        assert_eq!(retries[0].1.due_at, 42_000, "due_at is re-derived unchanged");
+    }
+
+    #[test]
+    fn a_retry_whose_due_at_is_already_past_at_load_is_eligible_now() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("claims.redb");
+
+        {
+            let store = Store::open(&path).unwrap();
+            store.schedule_retry("ITER-past", 1, "boom", 1_000).unwrap();
+            store.schedule_retry("ITER-future", 1, "boom", 100_000).unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        let now = 50_000;
+        let due = store.due_retries(now).unwrap();
+        assert_eq!(due.len(), 1, "only the past-due entry is eligible");
+        assert_eq!(due[0].0, "ITER-past");
+        assert!(due[0].1.due_at <= now);
+    }
+
+    #[test]
+    fn clear_retry_removes_the_entry() {
+        let dir = TempDir::new().unwrap();
+        let store = open(&dir);
+
+        store.schedule_retry("ITER-007", 1, "boom", 5_000).unwrap();
+        store.clear_retry("ITER-007").unwrap();
+
+        assert!(store.retries().unwrap().is_empty());
+    }
+
+    #[test]
+    fn clear_retry_on_an_absent_entry_is_a_no_op() {
+        let dir = TempDir::new().unwrap();
+        let store = open(&dir);
+
+        store.clear_retry("ITER-007").unwrap();
+        assert!(store.retries().unwrap().is_empty());
     }
 }
