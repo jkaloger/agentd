@@ -70,6 +70,7 @@ impl ClaudeAdapter {
         }
     }
 
+    #[cfg(test)]
     pub fn with_program(program: impl Into<String>, base_args: Vec<String>) -> Self {
         ClaudeAdapter {
             program: program.into(),

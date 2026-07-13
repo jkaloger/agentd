@@ -1,7 +1,7 @@
 ---
 title: Execute one iteration end-to-end
 type: iteration
-status: draft
+status: complete
 author: Jack Kaloger
 date: 2026-07-13
 tags: []

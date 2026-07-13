@@ -1,24 +1,18 @@
 use clap::{Parser, Subcommand};
 
-#[allow(dead_code)]
 mod adapter;
-#[allow(dead_code)]
 mod agent;
 mod config;
 mod daemon;
-#[allow(dead_code)]
 mod dispatch;
 mod init;
 mod mapping;
-#[allow(dead_code)]
 mod prompt;
-#[allow(dead_code)]
 mod resolve;
 #[allow(dead_code)]
 mod store;
-#[allow(dead_code)]
+mod tick;
 mod tracker;
-#[allow(dead_code)]
 mod workspace;
 
 /// agentd — a git-like daemon that orchestrates coding agents against a lazyspec backlog.
@@ -76,6 +70,7 @@ async fn run(command: Command) -> Result<(), String> {
         Command::Config => run_config(),
         Command::Start => run_start().await,
         Command::Status => run_status().await,
+        Command::Log { iter_id } => run_log(iter_id).await,
         Command::Stop => run_stop().await,
         other => {
             println!("unimplemented: {}", other.name());
@@ -122,9 +117,28 @@ async fn run_status() -> Result<(), String> {
     }
     for item in items {
         println!(
-            "{}\t{}\t{}\tstarted_at={}",
-            item.id, item.state, item.identifier, item.started_at_ms
+            "{}\t{}\t{}\t{}\truntime={}ms\tstarted_at={}",
+            item.id,
+            item.state,
+            item.identifier,
+            item.transition,
+            item.runtime_ms,
+            item.started_at_ms
         );
+    }
+    Ok(())
+}
+
+async fn run_log(iter_id: Option<String>) -> Result<(), String> {
+    let socket_path = store_dir()?.join("agentd.sock");
+    let lines = daemon::query_log(&socket_path, iter_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    if lines.is_empty() {
+        println!("no run history");
+    }
+    for line in lines {
+        println!("{line}");
     }
     Ok(())
 }
@@ -220,7 +234,11 @@ mod tests {
                 .unwrap_or_else(|e| panic!("failed to parse {args:?}: {e}"));
             if !matches!(
                 cli.command,
-                Command::Init | Command::Start | Command::Stop | Command::Status
+                Command::Init
+                    | Command::Start
+                    | Command::Stop
+                    | Command::Status
+                    | Command::Log { .. }
             ) {
                 run(cli.command).await.unwrap();
             }

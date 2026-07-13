@@ -10,26 +10,28 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use crate::config::{self, ConfigError};
+use crate::adapter::ClaudeAdapter;
+use crate::config::{self, Config, ConfigError};
 use crate::mapping::{DagSource, MappingError, RoleMapping};
+use crate::prompt;
+use crate::store::Store;
+use crate::tick::{RunRecord, TickReport, reconcile, run_tick};
+use crate::tracker::{LazyspecRunner, LazyspecTracker};
+
+const HOLDER: &str = "agentd";
 
 type SharedState = Arc<Mutex<DaemonState>>;
 
 #[derive(Default)]
 struct DaemonState {
-    items: Vec<RunningItem>,
-}
-
-struct RunningItem {
-    id: String,
-    identifier: String,
-    started_at: SystemTime,
+    records: Vec<RunRecord>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Request {
     Status,
+    Log { iter_id: Option<String> },
     Shutdown,
 }
 
@@ -37,6 +39,7 @@ pub enum Request {
 #[serde(rename_all = "snake_case")]
 pub enum Response {
     Status { items: Vec<ItemView> },
+    Log { lines: Vec<String> },
     Ok,
     Error { message: String },
 }
@@ -46,6 +49,8 @@ pub struct ItemView {
     pub id: String,
     pub identifier: String,
     pub state: String,
+    pub transition: String,
+    pub runtime_ms: u64,
     pub started_at_ms: u64,
 }
 
@@ -159,20 +164,40 @@ pub async fn start(
     let state: SharedState = Arc::new(Mutex::new(DaemonState::default()));
     let (shutdown_tx, _) = watch::channel(false);
 
+    let store_dir = config_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
+    let repo = store_dir
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| store_dir.clone());
+    let store_path = store_dir.join("store.redb");
+    let template = read_template(&repo, &config);
+    let tracker = LazyspecTracker::new(
+        LazyspecRunner::new(repo.clone()),
+        RoleMapping::from_config(&config),
+    );
+    let adapter = ClaudeAdapter::new(config.agent.auto_approve);
+    let worker_state = state.clone();
+
     let mut worker_handles = Vec::new();
-    let mut workers_spawned = 0;
-    if let Some(item) = stub_eligible_item() {
-        state.lock().unwrap().items.push(RunningItem {
-            id: item.id,
-            identifier: item.identifier,
-            started_at: SystemTime::now(),
-        });
-        let mut rx = shutdown_tx.subscribe();
-        worker_handles.push(tokio::spawn(async move {
-            wait_true(&mut rx).await;
-        }));
-        workers_spawned += 1;
-    }
+    worker_handles.push(tokio::spawn(async move {
+        let store = match Store::open(&store_path) {
+            Ok(store) => store,
+            Err(_) => return,
+        };
+        let now = now_ms();
+        let _ = reconcile(&store, &tracker, now);
+        let report = run_tick(
+            &tracker, &store, &adapter, &config, &template, &repo, now, HOLDER,
+        )
+        .await;
+        if let TickReport::Dispatched(record) = report {
+            worker_state.lock().unwrap().records.push(*record);
+        }
+    }));
+    let workers_spawned = 1;
 
     let accept_state = state.clone();
     let accept_tx = shutdown_tx.clone();
@@ -191,7 +216,18 @@ pub async fn query_status(socket_path: &Path) -> Result<Vec<ItemView>, DaemonErr
     match request(socket_path, &Request::Status).await? {
         Response::Status { items } => Ok(items),
         Response::Error { message } => Err(DaemonError::Protocol(message)),
-        Response::Ok => Err(DaemonError::Protocol("unexpected ok response".to_string())),
+        _ => Err(DaemonError::Protocol("unexpected response".to_string())),
+    }
+}
+
+pub async fn query_log(
+    socket_path: &Path,
+    iter_id: Option<String>,
+) -> Result<Vec<String>, DaemonError> {
+    match request(socket_path, &Request::Log { iter_id }).await? {
+        Response::Log { lines } => Ok(lines),
+        Response::Error { message } => Err(DaemonError::Protocol(message)),
+        _ => Err(DaemonError::Protocol("unexpected response".to_string())),
     }
 }
 
@@ -199,22 +235,13 @@ pub async fn send_shutdown(socket_path: &Path) -> Result<(), DaemonError> {
     match request(socket_path, &Request::Shutdown).await? {
         Response::Ok => Ok(()),
         Response::Error { message } => Err(DaemonError::Protocol(message)),
-        Response::Status { .. } => Err(DaemonError::Protocol(
-            "unexpected status response".to_string(),
-        )),
+        _ => Err(DaemonError::Protocol("unexpected response".to_string())),
     }
 }
 
-struct StubItem {
-    id: String,
-    identifier: String,
-}
-
-fn stub_eligible_item() -> Option<StubItem> {
-    Some(StubItem {
-        id: "ITER-002".to_string(),
-        identifier: "boot-and-pick-up-one-item".to_string(),
-    })
+fn read_template(repo: &Path, config: &Config) -> String {
+    std::fs::read_to_string(repo.join(&config.prompt.template))
+        .unwrap_or_else(|_| prompt::DEFAULT_TEMPLATE.to_string())
 }
 
 async fn bind_control_socket(path: &Path) -> Result<UnixListener, DaemonError> {
@@ -258,8 +285,19 @@ async fn handle_conn(stream: UnixStream, state: SharedState, shutdown_tx: watch:
 
     let response = match serde_json::from_str::<Request>(line.trim()) {
         Ok(Request::Status) => {
-            let items = state.lock().unwrap().items.iter().map(view).collect();
+            let items = state.lock().unwrap().records.iter().map(view).collect();
             Response::Status { items }
+        }
+        Ok(Request::Log { iter_id }) => {
+            let lines = state
+                .lock()
+                .unwrap()
+                .records
+                .iter()
+                .filter(|r| iter_id.as_deref().is_none_or(|id| r.id == id))
+                .flat_map(RunRecord::log_lines)
+                .collect();
+            Response::Log { lines }
         }
         Ok(Request::Shutdown) => {
             let _ = shutdown_tx.send(true);
@@ -307,17 +345,22 @@ async fn wait_true(rx: &mut watch::Receiver<bool>) {
     }
 }
 
-fn view(item: &RunningItem) -> ItemView {
+fn view(record: &RunRecord) -> ItemView {
     ItemView {
-        id: item.id.clone(),
-        identifier: item.identifier.clone(),
-        state: "Running".to_string(),
-        started_at_ms: to_millis(item.started_at),
+        id: record.id.clone(),
+        identifier: record.identifier.clone(),
+        state: record.state_label(),
+        transition: record.transition_target(),
+        runtime_ms: record.runtime_ms(),
+        started_at_ms: record.started_at_ms,
     }
 }
 
-fn to_millis(t: SystemTime) -> u64 {
-    t.duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 #[cfg(test)]

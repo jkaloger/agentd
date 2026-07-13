@@ -77,6 +77,20 @@ impl Store {
         Ok(record)
     }
 
+    /// Every persisted claim as `(id, record)`. Used by `reconcile` on restart to
+    /// find claims orphaned by a dead daemon.
+    pub fn claims(&self) -> Result<Vec<(String, ClaimRecord)>, StoreError> {
+        let txn = self.db.begin_read().map_err(storage)?;
+        let table = txn.open_table(CLAIMS).map_err(storage)?;
+        let mut claims = Vec::new();
+        for entry in table.iter().map_err(storage)? {
+            let (key, value) = entry.map_err(storage)?;
+            let record = serde_json::from_slice(value.value()).map_err(StoreError::Decode)?;
+            claims.push((key.value().to_string(), record));
+        }
+        Ok(claims)
+    }
+
     pub fn get(&self, id: &str) -> Result<Option<ClaimRecord>, StoreError> {
         let txn = self.db.begin_read().map_err(storage)?;
         let table = txn.open_table(CLAIMS).map_err(storage)?;
@@ -212,6 +226,23 @@ mod tests {
 
         store.release("ITER-007").unwrap();
         assert_eq!(store.get("ITER-007").unwrap(), None);
+    }
+
+    #[test]
+    fn claims_lists_every_persisted_row() {
+        let dir = TempDir::new().unwrap();
+        let store = open(&dir);
+
+        store.claim("ITER-001", "agent-a", 1000, TTL).unwrap();
+        store.claim("ITER-002", "agent-b", 1000, TTL).unwrap();
+
+        let mut claims = store.claims().unwrap();
+        claims.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(claims.len(), 2);
+        assert_eq!(claims[0].0, "ITER-001");
+        assert_eq!(claims[0].1.holder, "agent-a");
+        assert_eq!(claims[1].0, "ITER-002");
+        assert_eq!(claims[1].1.holder, "agent-b");
     }
 
     #[test]
