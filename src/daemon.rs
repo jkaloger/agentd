@@ -13,7 +13,7 @@ use tokio::task::JoinHandle;
 use crate::adapter::AgentAdapter;
 use crate::config::{self, Config, ConfigError};
 use crate::mapping::{DagSource, MappingError, RoleMapping};
-use crate::projection::{EventKind, Projection};
+use crate::projection::{EventKind, Projection, Snapshot};
 use crate::prompt;
 use crate::store::Store;
 use crate::tick::{RunRecord, SkipClaim, TickReport, reconcile, run_tick};
@@ -243,12 +243,17 @@ where
             Err(_) => return,
         };
         let projection = Projection::new(log_path);
+        let snapshot = Snapshot::new(store_dir);
         let now = now_ms();
         if let Ok(report) = reconcile(&store, &tracker, now) {
             // A daemon restart, not a new commit: there is no live holder to
             // attribute the release to, so the line carries only the id.
             for id in &report.released {
                 projection.record(now, id, EventKind::ReconcileRelease, &[]);
+                snapshot.remove_ref(id);
+            }
+            if let Ok(claims) = store.claims() {
+                snapshot.write_state(&claims);
             }
         }
 
@@ -292,27 +297,42 @@ where
                         EventKind::Release,
                         &[("holder", &record.holder)],
                     );
+                    snapshot.remove_ref(&record.id);
+                } else if let Ok(Some(held)) = store.get(&record.id) {
+                    snapshot.set_ref(&record.id, &held.holder, held.fence);
+                }
+                if let Ok(claims) = store.claims() {
+                    snapshot.write_state(&claims);
                 }
 
                 let mut state = worker_state.lock().unwrap();
                 state.running.retain(|item| item.id != record.id);
                 state.records.push(*record);
             }
-            TickReport::Skipped { id, claim, .. } => {
-                // Same post-commit seam as above (STORY-019 AC1): a gated-out
-                // advance still durably claims-then-releases before the tick
-                // reports Skipped, so those commits must reach the log too. A
-                // lost claim never touched the store, so it logs nothing.
-                if matches!(
-                    claim,
-                    SkipClaim::ClaimedThenReleased | SkipClaim::ClaimedReleaseFailed
-                ) {
+            // Same post-commit seam as above (STORY-019 AC1): a gated-out advance
+            // still durably claims-then-releases before the tick reports Skipped,
+            // so those commits must reach the log and snapshot too. A lost claim
+            // never touched the store, so it projects nothing.
+            TickReport::Skipped { id, claim, .. } => match claim {
+                SkipClaim::ClaimedThenReleased => {
                     projection.record(now, &id, EventKind::Claim, &[("holder", HOLDER)]);
-                }
-                if claim == SkipClaim::ClaimedThenReleased {
                     projection.record(now, &id, EventKind::Release, &[("holder", HOLDER)]);
+                    snapshot.remove_ref(&id);
+                    if let Ok(claims) = store.claims() {
+                        snapshot.write_state(&claims);
+                    }
                 }
-            }
+                SkipClaim::ClaimedReleaseFailed => {
+                    projection.record(now, &id, EventKind::Claim, &[("holder", HOLDER)]);
+                    if let Ok(Some(held)) = store.get(&id) {
+                        snapshot.set_ref(&id, &held.holder, held.fence);
+                    }
+                    if let Ok(claims) = store.claims() {
+                        snapshot.write_state(&claims);
+                    }
+                }
+                SkipClaim::NotClaimed => {}
+            },
             TickReport::Idle | TickReport::Error(_) => {}
         }
     })];
