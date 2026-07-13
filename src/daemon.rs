@@ -18,6 +18,7 @@ use crate::prompt;
 use crate::store::Store;
 use crate::tick::{RunRecord, SkipClaim, TickReport, reconcile, run_tick};
 use crate::tracker::{Candidate, Tracker};
+use crate::workspace::DiskWorktrees;
 
 const HOLDER: &str = "agentd";
 
@@ -246,16 +247,19 @@ where
         let snapshot = Snapshot::new(store_dir);
         let now = now_ms();
         let mapping = RoleMapping::from_config(&config);
-        if let Ok(report) = reconcile(&store, &tracker, &mapping, now) {
+        let worktrees = DiskWorktrees::new(repo.join(&config.workspace.root));
+        if let Ok(report) = reconcile(&store, &tracker, &worktrees, &mapping, now) {
             // A daemon restart, not a new commit: there is no live holder to
             // attribute the release to, so the line carries only the id. Expired
-            // orphans, vanished-doc drops, and completed finalizations are all
-            // durable claim releases, so each is projected the same way.
+            // orphans, vanished-doc drops, completed finalizations, and claims
+            // whose worktree vanished are all durable claim releases, so each is
+            // projected the same way.
             for id in report
                 .released
                 .iter()
                 .chain(&report.dropped)
                 .chain(&report.finalized)
+                .chain(&report.abandoned)
             {
                 projection.record(now, id, EventKind::ReconcileRelease, &[]);
                 snapshot.remove_ref(id);

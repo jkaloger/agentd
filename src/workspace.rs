@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fmt;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -44,6 +45,78 @@ impl std::error::Error for WorkspaceError {
             WorkspaceError::PathEscapesRoot { .. } | WorkspaceError::Git { .. } => None,
         }
     }
+}
+
+#[derive(Debug)]
+pub enum WorktreeListError {
+    Read(io::Error),
+}
+
+impl fmt::Display for WorktreeListError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WorktreeListError::Read(e) => write!(f, "cannot list worktrees on disk: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for WorktreeListError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            WorktreeListError::Read(e) => Some(e),
+        }
+    }
+}
+
+/// The worktrees reconcile finds on disk, so it can cross-check the store against
+/// the trees that actually exist (ADR-002). Injected like the tracker so reconcile
+/// tests can supply a present/absent/failing listing without touching git.
+pub trait WorktreeLister {
+    fn list_present(&self) -> Result<BTreeSet<String>, WorktreeListError>;
+}
+
+/// The live lister: a directory scan of the workspace root.
+pub struct DiskWorktrees {
+    root: PathBuf,
+}
+
+impl DiskWorktrees {
+    pub fn new(root: PathBuf) -> Self {
+        DiskWorktrees { root }
+    }
+}
+
+impl WorktreeLister for DiskWorktrees {
+    fn list_present(&self) -> Result<BTreeSet<String>, WorktreeListError> {
+        list_worktrees(&self.root)
+    }
+}
+
+/// Enumerate the worktrees present under `root`, keyed by the iteration id each
+/// was created for — `prepare_worktree` lays them out at `<root>/<iter-id>`, so a
+/// directory name is exactly the claim id it belongs to.
+///
+/// A missing root is an empty listing, not a failure: the workspace simply holds
+/// no trees yet. Only a genuine I/O fault errors, keeping a transient read failure
+/// distinguishable from "nothing is there" so reconcile can retry rather than
+/// mistake an unreadable directory for an emptied one.
+pub fn list_worktrees(root: &Path) -> Result<BTreeSet<String>, WorktreeListError> {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
+        Err(e) => return Err(WorktreeListError::Read(e)),
+    };
+
+    let mut ids = BTreeSet::new();
+    for entry in entries {
+        let entry = entry.map_err(WorktreeListError::Read)?;
+        if entry.file_type().map_err(WorktreeListError::Read)?.is_dir()
+            && let Some(name) = entry.file_name().to_str()
+        {
+            ids.insert(name.to_string());
+        }
+    }
+    Ok(ids)
 }
 
 /// Prepare an isolated worktree for `iter_id` under `root`, branching off the
@@ -249,6 +322,28 @@ mod tests {
             1,
             "no worktree may be registered when the id is rejected"
         );
+    }
+
+    #[test]
+    fn lists_worktrees_present_under_the_root_by_iter_id() {
+        let repo = init_repo();
+        let root = repo.path().join(".agentd/workspaces");
+        prepare_worktree(repo.path(), &root, "ITER-100", None).unwrap();
+        prepare_worktree(repo.path(), &root, "ITER-200", None).unwrap();
+
+        let present = list_worktrees(&root).unwrap();
+
+        assert!(present.contains("ITER-100"));
+        assert!(present.contains("ITER-200"));
+        assert_eq!(present.len(), 2);
+    }
+
+    #[test]
+    fn a_missing_root_lists_no_worktrees_without_erroring() {
+        let repo = init_repo();
+        let root = repo.path().join(".agentd/workspaces");
+
+        assert!(list_worktrees(&root).unwrap().is_empty());
     }
 
     #[test]

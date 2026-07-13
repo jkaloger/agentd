@@ -11,7 +11,7 @@ use crate::prompt::assemble_prompt;
 use crate::resolve::{OutcomeBranch, ResolvedTransition, resolve_outcome};
 use crate::store::{ClaimRecord, Store, StoreError};
 use crate::tracker::{Candidate, DocLookup, Tracker, TrackerError};
-use crate::workspace::{Worktree, prepare_worktree};
+use crate::workspace::{Worktree, WorktreeLister, WorktreeListError, prepare_worktree};
 
 /// How long a claim's lease is held before it is considered orphaned and
 /// reclaimable by `reconcile`. A single tick finishes well inside this window.
@@ -352,8 +352,15 @@ pub struct ReconcileReport {
     /// Live-lease claims whose document lazyspec reports terminal-complete:
     /// finalized, released without re-dispatch (STORY-017 AC2).
     pub finalized: Vec<String>,
-    /// Live leases whose document is still active, left in place (STORY-017 AC3).
+    /// Live leases whose document is still active, left in place (STORY-017 AC3,
+    /// STORY-065 AC1) — the working tree is present, so the run can resume.
     pub retained: Vec<String>,
+    /// Live-lease claims whose on-disk worktree has vanished: released, since the
+    /// run cannot resume without its tree (STORY-065 AC2).
+    pub abandoned: Vec<String>,
+    /// Worktrees on disk with no matching claim, reported for cleanup — never
+    /// deleted here (deletion is STORY-044) (STORY-065 AC3).
+    pub orphaned_worktrees: Vec<String>,
     /// Released ids the tracker would still offer as fresh — the double-dispatch
     /// risk. Must be empty: an item mid-run sits in an active (non-dispatch)
     /// state, so the role filter never re-offers it.
@@ -364,6 +371,7 @@ pub struct ReconcileReport {
 pub enum ReconcileError {
     Store(StoreError),
     Tracker(TrackerError),
+    Worktree(WorktreeListError),
 }
 
 impl std::fmt::Display for ReconcileError {
@@ -371,6 +379,7 @@ impl std::fmt::Display for ReconcileError {
         match self {
             ReconcileError::Store(e) => write!(f, "reconcile store error: {e:?}"),
             ReconcileError::Tracker(e) => write!(f, "reconcile tracker error: {e}"),
+            ReconcileError::Worktree(e) => write!(f, "reconcile worktree error: {e}"),
         }
     }
 }
@@ -383,20 +392,27 @@ impl std::error::Error for ReconcileError {}
 /// Every claim persisted across a restart was made by a now-dead daemon. A claim
 /// whose lease has expired is an orphan and is released regardless (STORY-016).
 /// A claim whose lease is still live is cross-checked against lazyspec, the truth
-/// for what work exists (ADR-002):
+/// for what work exists (ADR-002), and against the worktrees on disk (STORY-065):
 /// - the document is absent → drop the claim, its work has vanished (AC1);
 /// - the document is terminal-complete → finalize, release without re-dispatch (AC2);
-/// - the document is still active → retain the claim (AC3).
+/// - the document is still active and its worktree is present → retain (AC3 / AC1);
+/// - the document is still active but its worktree has vanished → release it as
+///   abandoned, the run cannot resume without its tree (STORY-065 AC2).
 ///
-/// If lazyspec cannot be read, reconcile mutates nothing and returns an error so
-/// the next cycle retries (AC4): every lazyspec read happens before any store
-/// write, so a read failure leaves all claims — orphans included — untouched.
+/// A worktree on disk with no matching claim is reported as orphaned for cleanup,
+/// never deleted here (STORY-065 AC3; deletion is STORY-044).
+///
+/// If lazyspec or the worktree listing cannot be read, reconcile mutates nothing
+/// and returns an error so the next cycle retries (AC4): every read — dispatch
+/// set, lazyspec, worktree scan — happens before any store write, so a read
+/// failure leaves all claims — orphans included — untouched and reports no orphan.
 ///
 /// The tracker's current dispatch set attests the invariant that a released id is
 /// never simultaneously dispatch-eligible, so a restart cannot double-dispatch.
-pub fn reconcile<T: Tracker>(
+pub fn reconcile<T: Tracker, W: WorktreeLister>(
     store: &Store,
     tracker: &T,
+    worktrees: &W,
     mapping: &RoleMapping,
     now: u64,
 ) -> Result<ReconcileReport, ReconcileError> {
@@ -408,9 +424,11 @@ pub fn reconcile<T: Tracker>(
         .collect();
 
     let claims = store.claims().map_err(ReconcileError::Store)?;
+    let claim_ids: BTreeSet<String> = claims.iter().map(|(id, _)| id.clone()).collect();
 
-    // Read every live lease's lazyspec state before touching the store: a read
-    // failure here must leave the whole store untouched so the next cycle retries.
+    // Read every live lease's lazyspec state and the on-disk worktrees before
+    // touching the store: any read failure here must leave the whole store
+    // untouched so the next cycle retries.
     let mut lookups: BTreeMap<String, DocLookup> = BTreeMap::new();
     for (id, record) in &claims {
         if record.due_at > now {
@@ -418,11 +436,13 @@ pub fn reconcile<T: Tracker>(
             lookups.insert(id.clone(), lookup);
         }
     }
+    let present = worktrees.list_present().map_err(ReconcileError::Worktree)?;
 
     let mut released = Vec::new();
     let mut dropped = Vec::new();
     let mut finalized = Vec::new();
     let mut retained = Vec::new();
+    let mut abandoned = Vec::new();
     let mut re_offered = Vec::new();
 
     for (id, record) in claims {
@@ -439,26 +459,41 @@ pub fn reconcile<T: Tracker>(
                 store.release(&id).map_err(ReconcileError::Store)?;
                 dropped.push(id);
             }
-            Some(DocLookup::Present(view)) => {
-                match mapping.classify(&view.doc_type, &view.status) {
-                    Some(StateRole::Terminal) => {
-                        store.release(&id).map_err(ReconcileError::Store)?;
-                        finalized.push(id);
-                    }
-                    // Active, dispatch, or unmapped: the work is not done, so the
-                    // claim stays put.
-                    _ => retained.push(id),
+            Some(DocLookup::Present(view))
+                if matches!(
+                    mapping.classify(&view.doc_type, &view.status),
+                    Some(StateRole::Terminal)
+                ) =>
+            {
+                store.release(&id).map_err(ReconcileError::Store)?;
+                finalized.push(id);
+            }
+            // Active, dispatch, unmapped, or an unlooked-up live lease: the work
+            // is not done, so the claim stays put — but only if its worktree
+            // survived; a vanished tree means the run cannot resume.
+            _ => {
+                if present.contains(&id) {
+                    retained.push(id);
+                } else {
+                    store.release(&id).map_err(ReconcileError::Store)?;
+                    abandoned.push(id);
                 }
             }
-            None => retained.push(id),
         }
     }
+
+    let orphaned_worktrees = present
+        .into_iter()
+        .filter(|id| !claim_ids.contains(id))
+        .collect();
 
     Ok(ReconcileReport {
         released,
         dropped,
         finalized,
         retained,
+        abandoned,
+        orphaned_worktrees,
         re_offered,
     })
 }
@@ -474,6 +509,7 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::io;
     use std::process::Command;
     use std::sync::{Arc, Mutex};
 
@@ -482,6 +518,7 @@ mod tests {
     use crate::adapter::TurnReport;
     use crate::config::load_str;
     use crate::tracker::DocView;
+    use crate::workspace::DiskWorktrees;
 
     const HOLDER: &str = "agentd-1";
     const NOW: u64 = 1_000_000;
@@ -599,6 +636,44 @@ mod tests {
         }
 
         async fn stop(&self, _session: Worktree) {}
+    }
+
+    /// A worktree lister fake: reports a fixed set of on-disk trees, or a scan
+    /// failure, without touching git — the seam reconcile cross-checks claims
+    /// against.
+    struct FakeWorktrees {
+        present: BTreeSet<String>,
+        fails: bool,
+    }
+
+    impl WorktreeLister for FakeWorktrees {
+        fn list_present(&self) -> Result<BTreeSet<String>, WorktreeListError> {
+            if self.fails {
+                return Err(WorktreeListError::Read(io::Error::other("worktree scan failed")));
+            }
+            Ok(self.present.clone())
+        }
+    }
+
+    fn worktrees_present(ids: &[&str]) -> FakeWorktrees {
+        FakeWorktrees {
+            present: ids.iter().map(|s| s.to_string()).collect(),
+            fails: false,
+        }
+    }
+
+    fn no_worktrees() -> FakeWorktrees {
+        FakeWorktrees {
+            present: BTreeSet::new(),
+            fails: false,
+        }
+    }
+
+    fn failing_worktrees() -> FakeWorktrees {
+        FakeWorktrees {
+            present: BTreeSet::new(),
+            fails: true,
+        }
     }
 
     fn git_ok(dir: &Path, args: &[&str]) {
@@ -914,8 +989,14 @@ mod tests {
         };
 
         let after_expiry = NOW + DEFAULT_LEASE_TTL.as_millis() as u64 + 1;
-        let report =
-            reconcile(&store, &tracker, &RoleMapping::adr003_default(), after_expiry).unwrap();
+        let report = reconcile(
+            &store,
+            &tracker,
+            &no_worktrees(),
+            &RoleMapping::adr003_default(),
+            after_expiry,
+        )
+        .unwrap();
 
         assert_eq!(report.released, vec!["ITER-014".to_string()]);
         assert!(
@@ -958,8 +1039,14 @@ mod tests {
         };
 
         let after_expiry = NOW + DEFAULT_LEASE_TTL.as_millis() as u64 + 1;
-        let mut report =
-            reconcile(&store, &tracker, &RoleMapping::adr003_default(), after_expiry).unwrap();
+        let mut report = reconcile(
+            &store,
+            &tracker,
+            &no_worktrees(),
+            &RoleMapping::adr003_default(),
+            after_expiry,
+        )
+        .unwrap();
         report.released.sort();
 
         assert_eq!(
@@ -981,7 +1068,14 @@ mod tests {
             .unwrap();
         let tracker = FakeTracker::new(candidate(), parent());
 
-        let report = reconcile(&store, &tracker, &RoleMapping::adr003_default(), NOW + 1).unwrap();
+        let report = reconcile(
+            &store,
+            &tracker,
+            &worktrees_present(&["ITER-014"]),
+            &RoleMapping::adr003_default(),
+            NOW + 1,
+        )
+        .unwrap();
 
         assert_eq!(report.retained, vec!["ITER-014".to_string()]);
         assert!(report.released.is_empty());
@@ -1030,7 +1124,14 @@ mod tests {
             DocLookup::Absent,
         )]));
 
-        let report = reconcile(&store, &tracker, &RoleMapping::adr003_default(), NOW + 1).unwrap();
+        let report = reconcile(
+            &store,
+            &tracker,
+            &no_worktrees(),
+            &RoleMapping::adr003_default(),
+            NOW + 1,
+        )
+        .unwrap();
 
         assert_eq!(report.dropped, vec!["ITER-014".to_string()]);
         assert!(report.retained.is_empty());
@@ -1048,7 +1149,14 @@ mod tests {
             iteration_doc("ITER-014", "complete"),
         )]));
 
-        let report = reconcile(&store, &tracker, &RoleMapping::adr003_default(), NOW + 1).unwrap();
+        let report = reconcile(
+            &store,
+            &tracker,
+            &no_worktrees(),
+            &RoleMapping::adr003_default(),
+            NOW + 1,
+        )
+        .unwrap();
 
         assert_eq!(report.finalized, vec!["ITER-014".to_string()]);
         assert!(report.re_offered.is_empty(), "{report:?}");
@@ -1073,7 +1181,14 @@ mod tests {
             iteration_doc("ITER-014", "in-progress"),
         )]));
 
-        let report = reconcile(&store, &tracker, &RoleMapping::adr003_default(), NOW + 1).unwrap();
+        let report = reconcile(
+            &store,
+            &tracker,
+            &worktrees_present(&["ITER-014"]),
+            &RoleMapping::adr003_default(),
+            NOW + 1,
+        )
+        .unwrap();
 
         assert_eq!(report.retained, vec!["ITER-014".to_string()]);
         assert!(report.dropped.is_empty());
@@ -1105,7 +1220,13 @@ mod tests {
             lookup_fails: true,
         };
 
-        let result = reconcile(&store, &tracker, &RoleMapping::adr003_default(), NOW + 1);
+        let result = reconcile(
+            &store,
+            &tracker,
+            &no_worktrees(),
+            &RoleMapping::adr003_default(),
+            NOW + 1,
+        );
 
         assert!(
             matches!(result, Err(ReconcileError::Tracker(_))),
@@ -1118,6 +1239,132 @@ mod tests {
         assert!(
             store.get("ITER-900").unwrap().is_some(),
             "even the expired orphan must be untouched on a read failure"
+        );
+    }
+
+    // STORY-065 AC1: a live-lease claim whose worktree is present on disk is
+    // retained untouched, and its tree is not reported as orphaned.
+    #[test]
+    fn reconcile_retains_a_live_lease_whose_worktree_is_present() {
+        let (_dir, store) = live_claim_store();
+        let tracker = tracker_with_lookups(HashMap::from([(
+            "ITER-014".to_string(),
+            iteration_doc("ITER-014", "in-progress"),
+        )]));
+
+        let report = reconcile(
+            &store,
+            &tracker,
+            &worktrees_present(&["ITER-014"]),
+            &RoleMapping::adr003_default(),
+            NOW + 1,
+        )
+        .unwrap();
+
+        assert_eq!(report.retained, vec!["ITER-014".to_string()]);
+        assert!(report.abandoned.is_empty());
+        assert!(report.orphaned_worktrees.is_empty());
+        assert!(
+            store.get("ITER-014").unwrap().is_some(),
+            "a live lease with its worktree must be left untouched"
+        );
+    }
+
+    // STORY-065 AC2: a live-lease claim whose worktree has vanished cannot resume,
+    // so it is released and recorded as abandoned.
+    #[test]
+    fn reconcile_releases_a_claim_whose_worktree_is_absent() {
+        let (_dir, store) = live_claim_store();
+        let tracker = tracker_with_lookups(HashMap::from([(
+            "ITER-014".to_string(),
+            iteration_doc("ITER-014", "in-progress"),
+        )]));
+
+        let report = reconcile(
+            &store,
+            &tracker,
+            &no_worktrees(),
+            &RoleMapping::adr003_default(),
+            NOW + 1,
+        )
+        .unwrap();
+
+        assert_eq!(report.abandoned, vec!["ITER-014".to_string()]);
+        assert!(report.retained.is_empty());
+        assert!(report.orphaned_worktrees.is_empty());
+        assert_eq!(
+            store.get("ITER-014").unwrap(),
+            None,
+            "a claim whose worktree vanished must be released"
+        );
+    }
+
+    // STORY-065 AC3: a worktree on disk with no matching claim is reported for
+    // cleanup and left on disk (deletion is STORY-044).
+    #[test]
+    fn reconcile_reports_an_orphaned_worktree_without_deleting_it() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(&dir.path().join("store.redb")).unwrap();
+        let root = dir.path().join("workspaces");
+        let orphan = root.join("ITER-777");
+        std::fs::create_dir_all(&orphan).unwrap();
+
+        // No claims and nothing dispatch-eligible: the tree stands alone.
+        let tracker = tracker_with_lookups(HashMap::new());
+
+        let report = reconcile(
+            &store,
+            &tracker,
+            &DiskWorktrees::new(root.clone()),
+            &RoleMapping::adr003_default(),
+            NOW + 1,
+        )
+        .unwrap();
+
+        assert_eq!(report.orphaned_worktrees, vec!["ITER-777".to_string()]);
+        assert!(
+            orphan.is_dir(),
+            "an orphaned worktree must be reported, not deleted"
+        );
+    }
+
+    // STORY-065 AC4: when the worktree listing fails, reconcile mutates no claim —
+    // not even an expired orphan — reports no orphan, and returns so the next cycle
+    // retries.
+    #[test]
+    fn reconcile_worktree_listing_failure_retains_every_claim_and_returns() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(&dir.path().join("store.redb")).unwrap();
+        store
+            .claim("ITER-014", HOLDER, NOW, DEFAULT_LEASE_TTL)
+            .unwrap();
+        store
+            .claim("ITER-900", HOLDER, NOW - 10, Duration::from_millis(1))
+            .unwrap();
+        let tracker = tracker_with_lookups(HashMap::from([(
+            "ITER-014".to_string(),
+            iteration_doc("ITER-014", "in-progress"),
+        )]));
+
+        let result = reconcile(
+            &store,
+            &tracker,
+            &failing_worktrees(),
+            &RoleMapping::adr003_default(),
+            NOW + 1,
+        );
+
+        assert!(
+            matches!(result, Err(ReconcileError::Worktree(_))),
+            "a worktree listing failure must surface as an error to retry: {result:?}"
+        );
+        assert!(
+            store.get("ITER-014").unwrap().is_some(),
+            "the live lease must be untouched"
+        );
+        assert!(
+            store.get("ITER-900").unwrap().is_some(),
+            "even the expired orphan must be untouched on a listing failure"
         );
     }
 
