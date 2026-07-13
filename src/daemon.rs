@@ -694,6 +694,57 @@ mod tests {
         assert_eq!(state.records[0].id, "ITER-014");
     }
 
+    // STORY-016 AC1/AC3: startup reconcile releases every expired orphan and
+    // projects one release line per id, so an operator sees each on restart.
+    // Socket-free, so it runs where the sandbox blocks bind.
+    #[tokio::test]
+    async fn reconcile_projects_a_release_line_for_each_orphan() {
+        let (_repo, config_path, _socket) = init_project("");
+        let store_dir = config_path.parent().unwrap().to_path_buf();
+        let log_path = store_dir.join("log");
+
+        // Two claims left by a dead daemon, both long expired and neither offered
+        // by the tracker, so reconcile must release both as orphans.
+        {
+            let store = Store::open(&store_dir.join("store.redb")).unwrap();
+            store
+                .claim("ITER-100", "dead", 0, Duration::from_millis(1))
+                .unwrap();
+            store
+                .claim("ITER-101", "dead", 0, Duration::from_millis(1))
+                .unwrap();
+        }
+
+        let (adapter, gate) = blocking_adapter();
+        let orch =
+            spawn_orchestrator(&config_path, load_str("").unwrap(), fake_tracker(), adapter);
+        gate.notify_one();
+        for handle in orch.worker_handles {
+            handle.await.unwrap();
+        }
+
+        let contents = std::fs::read_to_string(&log_path).unwrap();
+        let mut released: Vec<&str> = contents
+            .lines()
+            .filter(|l| l.contains("event=reconcile_release"))
+            .map(|l| {
+                l.split(' ')
+                    .find_map(|kv| kv.strip_prefix("iter="))
+                    .expect("a reconcile_release line carries an iter id")
+            })
+            .collect();
+        released.sort();
+        assert_eq!(
+            released,
+            vec!["ITER-100", "ITER-101"],
+            "one release line per orphan: {contents}"
+        );
+
+        let store = Store::open(&store_dir.join("store.redb")).unwrap();
+        assert_eq!(store.get("ITER-100").unwrap(), None);
+        assert_eq!(store.get("ITER-101").unwrap(), None);
+    }
+
     #[tokio::test]
     async fn start_binds_socket_spawns_one_worker_and_reports_running() {
         let (_repo, config_path, socket_path) = init_project("");

@@ -850,6 +850,42 @@ mod tests {
         );
     }
 
+    // STORY-016 AC3 (store side): a single pass releases every expired orphan,
+    // so reconcile hands the daemon N ids to project one release line each.
+    #[test]
+    fn reconcile_releases_all_expired_orphans() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(&dir.path().join("store.redb")).unwrap();
+        store
+            .claim("ITER-100", HOLDER, NOW, DEFAULT_LEASE_TTL)
+            .unwrap();
+        store
+            .claim("ITER-101", HOLDER, NOW, DEFAULT_LEASE_TTL)
+            .unwrap();
+
+        // The tracker offers nothing, so no released id is dispatch-eligible.
+        let tracker = FakeTracker {
+            candidate: Mutex::new(None),
+            parent: parent(),
+            advances: Arc::new(Mutex::new(Vec::new())),
+            drop_after_claim: false,
+            fail_advance: false,
+        };
+
+        let after_expiry = NOW + DEFAULT_LEASE_TTL.as_millis() as u64 + 1;
+        let mut report = reconcile(&store, &tracker, after_expiry).unwrap();
+        report.released.sort();
+
+        assert_eq!(
+            report.released,
+            vec!["ITER-100".to_string(), "ITER-101".to_string()]
+        );
+        assert!(report.retained.is_empty());
+        assert!(report.re_offered.is_empty(), "{report:?}");
+        assert_eq!(store.get("ITER-100").unwrap(), None);
+        assert_eq!(store.get("ITER-101").unwrap(), None);
+    }
+
     #[test]
     fn reconcile_leaves_a_live_lease_in_place() {
         let dir = TempDir::new().unwrap();
