@@ -31,3 +31,7 @@ ADR ──informs──▶ Story / Bug ──broken into──▶ Iteration ─�
 4. Iterations are executed, reviewed, and advanced to `complete`.
 
 Use `lazyspec` (or the `/lazy` router skill) to create, link, and advance documents.
+
+## git
+
+no need for branches. commit to main. wait for me to push.
