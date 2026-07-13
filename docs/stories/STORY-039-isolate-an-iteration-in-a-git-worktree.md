@@ -1,7 +1,7 @@
 ---
 title: Isolate an iteration in a git worktree
 type: story
-status: draft
+status: in-progress
 author: Jack Kaloger
 date: 2026-07-13
 tags: []

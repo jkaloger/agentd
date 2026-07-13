@@ -10,6 +10,8 @@ mod mapping;
 mod store;
 #[allow(dead_code)]
 mod tracker;
+#[allow(dead_code)]
+mod workspace;
 
 /// agentd — a git-like daemon that orchestrates coding agents against a lazyspec backlog.
 #[derive(Parser)]
