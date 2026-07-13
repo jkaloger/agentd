@@ -1,7 +1,7 @@
 ---
 title: Persist and re-derive retry schedules
 type: story
-status: draft
+status: accepted
 author: Jack Kaloger
 date: 2026-07-13
 tags: []

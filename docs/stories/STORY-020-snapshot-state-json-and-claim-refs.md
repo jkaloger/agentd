@@ -1,7 +1,7 @@
 ---
 title: Snapshot state.json and claim refs
 type: story
-status: draft
+status: accepted
 author: Jack Kaloger
 date: 2026-07-13
 tags: []

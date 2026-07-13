@@ -1,7 +1,7 @@
 ---
 title: Append-only event log projection
 type: story
-status: draft
+status: accepted
 author: Jack Kaloger
 date: 2026-07-13
 tags: []
