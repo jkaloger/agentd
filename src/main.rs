@@ -13,6 +13,8 @@ mod mapping;
 #[allow(dead_code)]
 mod prompt;
 #[allow(dead_code)]
+mod resolve;
+#[allow(dead_code)]
 mod store;
 #[allow(dead_code)]
 mod tracker;
