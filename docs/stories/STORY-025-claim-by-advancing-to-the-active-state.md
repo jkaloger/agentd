@@ -1,7 +1,7 @@
 ---
 title: Claim by advancing to the active state
 type: story
-status: in-progress
+status: complete
 author: Jack Kaloger
 date: 2026-07-13
 tags: []
