@@ -1,7 +1,7 @@
 ---
 title: Durable state and leasing
 type: adr
-status: draft
+status: accepted
 author: Jack Kaloger
 date: 2026-07-12
 tags: []

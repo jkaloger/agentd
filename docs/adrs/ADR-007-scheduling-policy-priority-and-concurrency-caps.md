@@ -1,7 +1,7 @@
 ---
 title: Scheduling policy priority and concurrency caps
 type: adr
-status: draft
+status: accepted
 author: Jack Kaloger
 date: 2026-07-13
 tags: []
