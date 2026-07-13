@@ -10,13 +10,13 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use crate::adapter::ClaudeAdapter;
+use crate::adapter::AgentAdapter;
 use crate::config::{self, Config, ConfigError};
 use crate::mapping::{DagSource, MappingError, RoleMapping};
 use crate::prompt;
 use crate::store::Store;
 use crate::tick::{RunRecord, TickReport, reconcile, run_tick};
-use crate::tracker::{LazyspecRunner, LazyspecTracker};
+use crate::tracker::{Candidate, Tracker};
 
 const HOLDER: &str = "agentd";
 
@@ -24,7 +24,17 @@ type SharedState = Arc<Mutex<DaemonState>>;
 
 #[derive(Default)]
 struct DaemonState {
+    running: Vec<RunningItem>,
     records: Vec<RunRecord>,
+}
+
+/// An item published as Running the moment it is claimed and activated, before
+/// its turn finishes. It is dropped from `running` and replaced by a terminal
+/// `RunRecord` once the tick resolves.
+struct RunningItem {
+    id: String,
+    identifier: String,
+    started_at_ms: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -148,12 +158,22 @@ impl Daemon {
     }
 }
 
-/// Validate config, bind the control socket, and run one immediate orchestrator tick.
-pub async fn start(
+/// Validate config, bind the control socket, spawn the orchestrator worker, and
+/// serve control requests. The tracker and adapter are injected (ADR-004): the
+/// binary wires the live lazyspec tracker and claude adapter; tests substitute
+/// fakes to exercise the whole composition without a live backend.
+pub async fn start<T, A>(
     config_path: &Path,
     socket_path: &Path,
     dag: &dyn DagSource,
-) -> Result<Daemon, DaemonError> {
+    tracker: T,
+    adapter: A,
+) -> Result<Daemon, DaemonError>
+where
+    T: Tracker + Send + Sync + 'static,
+    A: AgentAdapter + Send + Sync + 'static,
+    A::Session: Send,
+{
     let config = config::load(config_path).map_err(DaemonError::Config)?;
     RoleMapping::from_config(&config)
         .validate(dag)
@@ -161,6 +181,45 @@ pub async fn start(
 
     let listener = bind_control_socket(socket_path).await?;
 
+    let orchestrator = spawn_orchestrator(config_path, config, tracker, adapter);
+
+    let accept_state = orchestrator.state.clone();
+    let accept_tx = orchestrator.shutdown_tx.clone();
+    let accept_handle = tokio::spawn(accept_loop(listener, accept_state, accept_tx));
+
+    Ok(Daemon {
+        socket_path: socket_path.to_path_buf(),
+        shutdown_tx: orchestrator.shutdown_tx,
+        workers_spawned: orchestrator.worker_handles.len(),
+        accept_handle,
+        worker_handles: orchestrator.worker_handles,
+    })
+}
+
+/// The orchestrator half of the daemon: shared state, the shutdown channel, and
+/// the worker task(s). Bound separately from the control socket so the dispatch
+/// path is exercisable without binding — the socket bind is what a sandbox
+/// blocks, not the orchestration.
+struct Orchestrator {
+    state: SharedState,
+    shutdown_tx: watch::Sender<bool>,
+    worker_handles: Vec<JoinHandle<()>>,
+}
+
+/// Reconcile the store, then run one tick, publishing the claimed item as Running
+/// the moment it is activated and replacing it with a terminal record when the
+/// turn resolves. No socket is bound here.
+fn spawn_orchestrator<T, A>(
+    config_path: &Path,
+    config: Config,
+    tracker: T,
+    adapter: A,
+) -> Orchestrator
+where
+    T: Tracker + Send + Sync + 'static,
+    A: AgentAdapter + Send + Sync + 'static,
+    A::Session: Send,
+{
     let state: SharedState = Arc::new(Mutex::new(DaemonState::default()));
     let (shutdown_tx, _) = watch::channel(false);
 
@@ -174,42 +233,50 @@ pub async fn start(
         .unwrap_or_else(|| store_dir.clone());
     let store_path = store_dir.join("store.redb");
     let template = read_template(&repo, &config);
-    let tracker = LazyspecTracker::new(
-        LazyspecRunner::new(repo.clone()),
-        RoleMapping::from_config(&config),
-    );
-    let adapter = ClaudeAdapter::new(config.agent.auto_approve);
     let worker_state = state.clone();
 
-    let mut worker_handles = Vec::new();
-    worker_handles.push(tokio::spawn(async move {
+    let worker_handles = vec![tokio::spawn(async move {
         let store = match Store::open(&store_path) {
             Ok(store) => store,
             Err(_) => return,
         };
         let now = now_ms();
         let _ = reconcile(&store, &tracker, now);
+
+        let running_state = worker_state.clone();
+        let on_activated = move |candidate: &Candidate| {
+            running_state.lock().unwrap().running.push(RunningItem {
+                id: candidate.id.clone(),
+                identifier: candidate.identifier.clone(),
+                started_at_ms: now_ms(),
+            });
+        };
+
         let report = run_tick(
-            &tracker, &store, &adapter, &config, &template, &repo, now, HOLDER,
+            &tracker,
+            &store,
+            &adapter,
+            &config,
+            &template,
+            &repo,
+            now,
+            HOLDER,
+            on_activated,
         )
         .await;
+
         if let TickReport::Dispatched(record) = report {
-            worker_state.lock().unwrap().records.push(*record);
+            let mut state = worker_state.lock().unwrap();
+            state.running.retain(|item| item.id != record.id);
+            state.records.push(*record);
         }
-    }));
-    let workers_spawned = 1;
+    })];
 
-    let accept_state = state.clone();
-    let accept_tx = shutdown_tx.clone();
-    let accept_handle = tokio::spawn(accept_loop(listener, accept_state, accept_tx));
-
-    Ok(Daemon {
-        socket_path: socket_path.to_path_buf(),
+    Orchestrator {
+        state,
         shutdown_tx,
-        workers_spawned,
-        accept_handle,
         worker_handles,
-    })
+    }
 }
 
 pub async fn query_status(socket_path: &Path) -> Result<Vec<ItemView>, DaemonError> {
@@ -285,7 +352,13 @@ async fn handle_conn(stream: UnixStream, state: SharedState, shutdown_tx: watch:
 
     let response = match serde_json::from_str::<Request>(line.trim()) {
         Ok(Request::Status) => {
-            let items = state.lock().unwrap().records.iter().map(view).collect();
+            let state = state.lock().unwrap();
+            let items = state
+                .running
+                .iter()
+                .map(running_view)
+                .chain(state.records.iter().map(view))
+                .collect();
             Response::Status { items }
         }
         Ok(Request::Log { iter_id }) => {
@@ -345,6 +418,17 @@ async fn wait_true(rx: &mut watch::Receiver<bool>) {
     }
 }
 
+fn running_view(item: &RunningItem) -> ItemView {
+    ItemView {
+        id: item.id.clone(),
+        identifier: item.identifier.clone(),
+        state: "Running".to_string(),
+        transition: "-".to_string(),
+        runtime_ms: 0,
+        started_at_ms: item.started_at_ms,
+    }
+}
+
 fn view(record: &RunRecord) -> ItemView {
     ItemView {
         id: record.id.clone(),
@@ -366,8 +450,95 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mapping::StubDag;
+    use std::os::unix::net::UnixListener as StdUnixListener;
+    use std::process::Command;
+    use std::sync::Arc;
+    use std::time::Duration;
+
     use tempfile::TempDir;
+    use tokio::sync::Notify;
+
+    use crate::adapter::{TurnOutcome, TurnReport};
+    use crate::agent::AgentEvent;
+    use crate::config::load_str;
+    use crate::mapping::StubDag;
+    use crate::tracker::{DocView, TrackerError};
+    use crate::workspace::Worktree;
+
+    /// A tracker fake offering one candidate, a canned parent for prompt
+    /// assembly, and recording every advance.
+    struct FakeTracker {
+        candidate: Candidate,
+        parent: DocView,
+    }
+
+    impl Tracker for FakeTracker {
+        fn fetch_dispatchable(&self) -> Result<Vec<Candidate>, TrackerError> {
+            Ok(vec![self.candidate.clone()])
+        }
+
+        fn fetch_doc(&self, _id: &str) -> Result<DocView, TrackerError> {
+            Ok(self.parent.clone())
+        }
+
+        fn advance(&self, _id: &str, _target: &str) -> Result<(), TrackerError> {
+            Ok(())
+        }
+    }
+
+    /// An adapter fake whose turn blocks on a gate until the test releases it, so
+    /// the item is observably Running while the turn is in flight.
+    struct BlockingAdapter {
+        gate: Arc<Notify>,
+    }
+
+    impl AgentAdapter for BlockingAdapter {
+        type Session = Worktree;
+
+        fn start_session(&self, worktree: Worktree) -> Worktree {
+            worktree
+        }
+
+        async fn run_turn(&self, _session: &Worktree, _prompt: &str) -> TurnReport {
+            self.gate.notified().await;
+            TurnReport {
+                outcome: TurnOutcome::Completed,
+                events: vec![AgentEvent::TurnCompleted { pid: 1, at_ms: 1 }],
+            }
+        }
+
+        async fn stop(&self, _session: Worktree) {}
+    }
+
+    fn git_ok(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?} failed");
+    }
+
+    /// A git repo with a `.agentd/` store dir holding the config, mirroring the
+    /// real layout so `spawn_orchestrator`'s `repo = store_dir.parent()` lands on
+    /// the git root that `prepare_worktree` needs.
+    fn init_project(config_body: &str) -> (TempDir, PathBuf, PathBuf) {
+        let repo = TempDir::new().unwrap();
+        git_ok(repo.path(), &["init", "-q"]);
+        git_ok(repo.path(), &["config", "user.email", "test@example.com"]);
+        git_ok(repo.path(), &["config", "user.name", "agentd test"]);
+        std::fs::write(repo.path().join("README.md"), "base").unwrap();
+        git_ok(repo.path(), &["add", "."]);
+        git_ok(repo.path(), &["commit", "-q", "-m", "base"]);
+
+        let store_dir = repo.path().join(".agentd");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        let config_path = store_dir.join("config.toml");
+        std::fs::write(&config_path, config_body).unwrap();
+        let socket_path = store_dir.join("agentd.sock");
+        (repo, config_path, socket_path)
+    }
 
     fn write_config(dir: &Path, body: &str) -> PathBuf {
         let path = dir.join("config.toml");
@@ -375,25 +546,123 @@ mod tests {
         path
     }
 
+    fn fake_tracker() -> FakeTracker {
+        FakeTracker {
+            candidate: Candidate {
+                id: "ITER-014".to_string(),
+                identifier: "execute-one-iteration".to_string(),
+                title: "Execute one iteration end-to-end".to_string(),
+                body: "Objective: prove the full path.".to_string(),
+                state: "accepted".to_string(),
+                parent: Some("STORY-060".to_string()),
+                dependencies: Vec::new(),
+            },
+            parent: DocView {
+                id: "STORY-060".to_string(),
+                doc_type: "story".to_string(),
+                title: "Execute one iteration end-to-end".to_string(),
+                body: "As an operator, I want one eligible iteration to flow.".to_string(),
+            },
+        }
+    }
+
+    fn blocking_adapter() -> (BlockingAdapter, Arc<Notify>) {
+        let gate = Arc::new(Notify::new());
+        (
+            BlockingAdapter {
+                gate: gate.clone(),
+            },
+            gate,
+        )
+    }
+
+    /// The sandbox denies `AF_UNIX` bind (Operation not permitted). Socket
+    /// round-trip tests probe for it and skip rather than fail; the socket-free
+    /// orchestration test below still covers the dispatch path there.
+    fn sandbox_blocks_bind(dir: &Path) -> bool {
+        let probe = dir.join(".bind-probe.sock");
+        match StdUnixListener::bind(&probe) {
+            Ok(_) => {
+                let _ = std::fs::remove_file(&probe);
+                false
+            }
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => true,
+            Err(_) => false,
+        }
+    }
+
+    async fn wait_for_status(socket_path: &Path) -> Vec<ItemView> {
+        for _ in 0..200 {
+            let items = query_status(socket_path).await.unwrap();
+            if !items.is_empty() {
+                return items;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("no status item appeared");
+    }
+
+    // The dispatch path — claim, publish Running, run the turn — without binding a
+    // control socket, so it is exercised even where the sandbox blocks bind.
+    #[tokio::test]
+    async fn orchestrator_publishes_running_then_records_terminal() {
+        let (_repo, config_path, _socket) = init_project("");
+        let (adapter, gate) = blocking_adapter();
+        let orch = spawn_orchestrator(&config_path, load_str("").unwrap(), fake_tracker(), adapter);
+
+        let mut running = None;
+        for _ in 0..200 {
+            if let Some(item) = orch.state.lock().unwrap().running.first() {
+                running = Some(running_view(item));
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let running = running.expect("running item never appeared");
+        assert_eq!(running.state, "Running");
+        assert_eq!(running.identifier, "execute-one-iteration");
+        assert!(running.started_at_ms > 0);
+
+        gate.notify_one();
+        for handle in orch.worker_handles {
+            handle.await.unwrap();
+        }
+
+        let state = orch.state.lock().unwrap();
+        assert!(state.running.is_empty(), "running item must be cleared");
+        assert_eq!(state.records.len(), 1);
+        assert_eq!(state.records[0].id, "ITER-014");
+    }
+
     #[tokio::test]
     async fn start_binds_socket_spawns_one_worker_and_reports_running() {
-        let dir = TempDir::new().unwrap();
-        let config_path = write_config(dir.path(), "");
-        let socket_path = dir.path().join("agentd.sock");
+        let (_repo, config_path, socket_path) = init_project("");
+        if sandbox_blocks_bind(socket_path.parent().unwrap()) {
+            eprintln!("skipping: sandbox blocks AF_UNIX bind");
+            return;
+        }
+        let (adapter, gate) = blocking_adapter();
 
-        let daemon = start(&config_path, &socket_path, &StubDag::iteration())
-            .await
-            .unwrap();
+        let daemon = start(
+            &config_path,
+            &socket_path,
+            &StubDag::iteration(),
+            fake_tracker(),
+            adapter,
+        )
+        .await
+        .unwrap();
         assert!(socket_path.exists());
         assert_eq!(daemon.workers_spawned(), 1);
 
-        let items = query_status(&socket_path).await.unwrap();
+        let items = wait_for_status(&socket_path).await;
         assert_eq!(items.len(), 1);
         let item = &items[0];
         assert_eq!(item.state, "Running");
         assert!(!item.identifier.is_empty());
         assert!(item.started_at_ms > 0);
 
+        gate.notify_one();
         daemon.shutdown().await;
         assert!(!socket_path.exists());
     }
@@ -403,10 +672,17 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let config_path = write_config(dir.path(), "poll_interval_ms = 0");
         let socket_path = dir.path().join("agentd.sock");
+        let (adapter, _gate) = blocking_adapter();
 
-        let err = start(&config_path, &socket_path, &StubDag::iteration())
-            .await
-            .unwrap_err();
+        let err = start(
+            &config_path,
+            &socket_path,
+            &StubDag::iteration(),
+            fake_tracker(),
+            adapter,
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, DaemonError::Config(_)), "{err}");
         assert!(!socket_path.exists());
     }
@@ -416,10 +692,17 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let config_path = dir.path().join("absent.toml");
         let socket_path = dir.path().join("agentd.sock");
+        let (adapter, _gate) = blocking_adapter();
 
-        let err = start(&config_path, &socket_path, &StubDag::iteration())
-            .await
-            .unwrap_err();
+        let err = start(
+            &config_path,
+            &socket_path,
+            &StubDag::iteration(),
+            fake_tracker(),
+            adapter,
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, DaemonError::Config(_)), "{err}");
         assert!(!socket_path.exists());
     }
@@ -432,10 +715,17 @@ mod tests {
             "[dispatch]\ntypes = [\"iteration\"]\n[dispatch.states]\nshipped = \"terminal\"\n",
         );
         let socket_path = dir.path().join("agentd.sock");
+        let (adapter, _gate) = blocking_adapter();
 
-        let err = start(&config_path, &socket_path, &StubDag::iteration())
-            .await
-            .unwrap_err();
+        let err = start(
+            &config_path,
+            &socket_path,
+            &StubDag::iteration(),
+            fake_tracker(),
+            adapter,
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, DaemonError::Mapping(_)), "{err}");
         assert!(err.to_string().contains("shipped"), "{err}");
         assert!(!socket_path.exists());
@@ -443,14 +733,24 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_over_socket_stops_daemon_and_removes_socket() {
-        let dir = TempDir::new().unwrap();
-        let config_path = write_config(dir.path(), "");
-        let socket_path = dir.path().join("agentd.sock");
+        let (_repo, config_path, socket_path) = init_project("");
+        if sandbox_blocks_bind(socket_path.parent().unwrap()) {
+            eprintln!("skipping: sandbox blocks AF_UNIX bind");
+            return;
+        }
+        let (adapter, gate) = blocking_adapter();
 
-        let daemon = start(&config_path, &socket_path, &StubDag::iteration())
-            .await
-            .unwrap();
+        let daemon = start(
+            &config_path,
+            &socket_path,
+            &StubDag::iteration(),
+            fake_tracker(),
+            adapter,
+        )
+        .await
+        .unwrap();
         send_shutdown(&socket_path).await.unwrap();
+        gate.notify_one();
         daemon.wait().await;
         daemon.shutdown().await;
 
@@ -459,15 +759,25 @@ mod tests {
 
     #[tokio::test]
     async fn stale_socket_file_is_reclaimed() {
-        let dir = TempDir::new().unwrap();
-        let config_path = write_config(dir.path(), "");
-        let socket_path = dir.path().join("agentd.sock");
+        let (_repo, config_path, socket_path) = init_project("");
+        if sandbox_blocks_bind(socket_path.parent().unwrap()) {
+            eprintln!("skipping: sandbox blocks AF_UNIX bind");
+            return;
+        }
         std::fs::write(&socket_path, b"stale").unwrap();
+        let (adapter, gate) = blocking_adapter();
 
-        let daemon = start(&config_path, &socket_path, &StubDag::iteration())
-            .await
-            .unwrap();
-        assert_eq!(query_status(&socket_path).await.unwrap().len(), 1);
+        let daemon = start(
+            &config_path,
+            &socket_path,
+            &StubDag::iteration(),
+            fake_tracker(),
+            adapter,
+        )
+        .await
+        .unwrap();
+        assert_eq!(wait_for_status(&socket_path).await.len(), 1);
+        gate.notify_one();
         daemon.shutdown().await;
     }
 }

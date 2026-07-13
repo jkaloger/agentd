@@ -148,8 +148,12 @@ fn event_label(event: &AgentEvent) -> String {
 ///
 /// Every seam is injected: the tracker, store, adapter, template source, and
 /// clock, so the whole composition is exercised without a live daemon.
+///
+/// `on_activated` fires exactly once, after the claim and advance-to-active both
+/// succeed and before the agent runs — the seam the daemon uses to publish the
+/// item as Running while the turn is in flight.
 #[allow(clippy::too_many_arguments)]
-pub async fn run_tick<T, A>(
+pub async fn run_tick<T, A, R>(
     tracker: &T,
     store: &Store,
     adapter: &A,
@@ -158,10 +162,12 @@ pub async fn run_tick<T, A>(
     repo: &Path,
     now: u64,
     holder: &str,
+    on_activated: R,
 ) -> TickReport
 where
     T: Tracker,
     A: AgentAdapter,
+    R: FnOnce(&Candidate),
 {
     let candidates = match tracker.fetch_dispatchable() {
         Ok(candidates) => candidates,
@@ -179,7 +185,7 @@ where
         now,
         DEFAULT_LEASE_TTL,
         &config.transitions.claim,
-        || {},
+        || on_activated(&candidate),
     ) {
         Ok(claim) => claim,
         Err(e) => {
@@ -573,6 +579,7 @@ mod tests {
             repo.path(),
             NOW,
             HOLDER,
+            |_| {},
         )
         .await;
 
@@ -698,6 +705,7 @@ mod tests {
             repo.path(),
             NOW,
             HOLDER,
+            |_| {},
         )
         .await;
 
@@ -749,6 +757,7 @@ mod tests {
             repo.path(),
             NOW,
             HOLDER,
+            |_| {},
         )
         .await;
 
@@ -840,6 +849,7 @@ mod tests {
             repo.path(),
             NOW,
             HOLDER,
+            |_| {},
         )
         .await;
 

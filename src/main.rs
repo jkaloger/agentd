@@ -91,8 +91,16 @@ async fn run_start() -> Result<(), String> {
     let socket_path = store.join("agentd.sock");
 
     let project_root = store.parent().unwrap_or(&store).to_path_buf();
-    let dag = mapping::LazyspecCli::new(project_root);
-    let daemon = daemon::start(&config_path, &socket_path, &dag)
+    let dag = mapping::LazyspecCli::new(project_root.clone());
+
+    let config = config::load(&config_path).map_err(|e| e.to_string())?;
+    let tracker = tracker::LazyspecTracker::new(
+        tracker::LazyspecRunner::new(project_root),
+        mapping::RoleMapping::from_config(&config),
+    );
+    let adapter = adapter::ClaudeAdapter::new(config.agent.auto_approve);
+
+    let daemon = daemon::start(&config_path, &socket_path, &dag, tracker, adapter)
         .await
         .map_err(|e| e.to_string())?;
     println!(

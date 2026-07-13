@@ -11,15 +11,18 @@ use crate::workspace::Worktree;
 /// claude adapter drives one-shot `claude -p` turns — the process exits after a
 /// turn — while a persistent backend (codex) would keep a live process across
 /// turns behind the same three methods.
-#[allow(async_fn_in_trait)]
 pub trait AgentAdapter {
     type Session;
 
     fn start_session(&self, worktree: Worktree) -> Self::Session;
 
-    async fn run_turn(&self, session: &Self::Session, prompt: &str) -> TurnReport;
+    fn run_turn(
+        &self,
+        session: &Self::Session,
+        prompt: &str,
+    ) -> impl std::future::Future<Output = TurnReport> + Send;
 
-    async fn stop(&self, session: Self::Session);
+    fn stop(&self, session: Self::Session) -> impl std::future::Future<Output = ()> + Send;
 }
 
 /// The canonical events observed during a turn plus the adapter's authoritative
