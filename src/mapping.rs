@@ -108,14 +108,20 @@ impl DagSource for LazyspecCli {
                 stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
             });
         }
-        let parsed: CliConfig = serde_json::from_slice(&output.stdout).map_err(DagError::Parse)?;
-        parsed
-            .types
-            .into_iter()
-            .find(|t| t.name == doc_type)
-            .map(|t| t.lifecycle.states)
-            .ok_or_else(|| DagError::UnknownType(doc_type.to_string()))
+        states_from_config(&output.stdout, doc_type)
     }
+}
+
+/// Parse `lazyspec config show --json` stdout and return a document type's
+/// lifecycle states. Shared by every seam that shells to the config command.
+pub(crate) fn states_from_config(stdout: &[u8], doc_type: &str) -> Result<Vec<String>, DagError> {
+    let parsed: CliConfig = serde_json::from_slice(stdout).map_err(DagError::Parse)?;
+    parsed
+        .types
+        .into_iter()
+        .find(|t| t.name == doc_type)
+        .map(|t| t.lifecycle.states)
+        .ok_or_else(|| DagError::UnknownType(doc_type.to_string()))
 }
 
 #[derive(Deserialize)]
