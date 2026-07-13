@@ -7,6 +7,7 @@ mod daemon;
 mod dispatch;
 mod init;
 mod mapping;
+mod projection;
 mod prompt;
 mod resolve;
 #[allow(dead_code)]

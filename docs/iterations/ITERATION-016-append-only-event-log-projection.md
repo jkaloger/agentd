@@ -1,7 +1,7 @@
 ---
 title: Append-only event log projection
 type: iteration
-status: accepted
+status: complete
 author: Jack Kaloger
 date: 2026-07-13
 tags: []

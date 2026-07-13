@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::adapter::{AgentAdapter, TurnOutcome};
 use crate::agent::AgentEvent;
 use crate::config::Config;
-use crate::dispatch::claim_and_activate;
+use crate::dispatch::{DispatchError, claim_and_activate};
 use crate::prompt::assemble_prompt;
 use crate::resolve::{OutcomeBranch, ResolvedTransition, resolve_outcome};
 use crate::store::{ClaimRecord, Store, StoreError};
@@ -27,9 +27,30 @@ pub enum TickReport {
     Dispatched(Box<RunRecord>),
     /// A candidate was fetched but not run — the claim was lost to another
     /// holder, or the advance-to-active was gated out (its claim was released).
-    Skipped { id: String, reason: String },
+    Skipped {
+        id: String,
+        reason: String,
+        claim: SkipClaim,
+    },
     /// The tick could not fetch candidates.
     Error(String),
+}
+
+/// What durably happened to the store claim behind a `Skipped` tick (STORY-019
+/// AC1). The projection log records every durable state change, so the post-commit
+/// seam needs to know whether `claim_and_activate` actually committed anything —
+/// a lost claim never touches the store, but a gated-out advance commits a claim
+/// and then releases it, both of which must reach the log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkipClaim {
+    /// The store claim was never committed — another holder already owned it.
+    NotClaimed,
+    /// The store claim committed, then was durably released after the advance
+    /// it gated on was rejected.
+    ClaimedThenReleased,
+    /// The store claim committed, but the subsequent release attempt itself
+    /// failed; the store still authoritatively holds the claim.
+    ClaimedReleaseFailed,
 }
 
 /// The full trace of one dispatched item: claimed -> running -> terminal, plus
@@ -189,9 +210,15 @@ where
     ) {
         Ok(claim) => claim,
         Err(e) => {
+            let claim = match &e {
+                DispatchError::Claim(_) => SkipClaim::NotClaimed,
+                DispatchError::Advance(_) => SkipClaim::ClaimedThenReleased,
+                DispatchError::Release(_) => SkipClaim::ClaimedReleaseFailed,
+            };
             return TickReport::Skipped {
                 id: candidate.id,
                 reason: e.to_string(),
+                claim,
             };
         }
     };
@@ -416,6 +443,7 @@ mod tests {
         parent: DocView,
         advances: Arc<Mutex<Vec<(String, String)>>>,
         drop_after_claim: bool,
+        fail_advance: bool,
     }
 
     impl FakeTracker {
@@ -425,6 +453,7 @@ mod tests {
                 parent,
                 advances: Arc::new(Mutex::new(Vec::new())),
                 drop_after_claim: false,
+                fail_advance: false,
             }
         }
 
@@ -447,6 +476,12 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((id.to_string(), target.to_string()));
+            if self.fail_advance {
+                return Err(TrackerError::Command {
+                    code: Some(1),
+                    stderr: "gate rejected".to_string(),
+                });
+            }
             if self.drop_after_claim {
                 *self.candidate.lock().unwrap() = None;
             }
@@ -745,6 +780,7 @@ mod tests {
             parent: parent(),
             advances: Arc::new(Mutex::new(Vec::new())),
             drop_after_claim: false,
+            fail_advance: false,
         };
         let adapter = FakeAdapter::new(completed_report());
 
@@ -792,6 +828,7 @@ mod tests {
             parent: parent(),
             advances: Arc::new(Mutex::new(Vec::new())),
             drop_after_claim: false,
+            fail_advance: false,
         };
 
         let after_expiry = NOW + DEFAULT_LEASE_TTL.as_millis() as u64 + 1;
@@ -853,10 +890,66 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(report, TickReport::Skipped { .. }), "{report:?}");
+        assert!(
+            matches!(
+                report,
+                TickReport::Skipped {
+                    claim: SkipClaim::NotClaimed,
+                    ..
+                }
+            ),
+            "no durable claim was ever committed on a lost claim: {report:?}"
+        );
         assert_eq!(
             store.get("ITER-014").unwrap().unwrap().holder,
             "other-agent"
+        );
+    }
+
+    // STORY-019 AC1: a rejected advance still committed a claim (then released
+    // it) before the tick reported Skipped — that must be distinguishable from
+    // a lost claim so the daemon's projection can log both the claim and the
+    // release, not neither (see daemon.rs's post-commit seam).
+    #[tokio::test]
+    async fn advance_gated_out_is_skipped_with_claim_committed_then_released() {
+        let repo = init_repo();
+        let store = store(repo.path());
+        let tracker = FakeTracker {
+            candidate: Mutex::new(Some(candidate())),
+            parent: parent(),
+            advances: Arc::new(Mutex::new(Vec::new())),
+            drop_after_claim: false,
+            fail_advance: true,
+        };
+        let adapter = FakeAdapter::new(completed_report());
+
+        let report = run_tick(
+            &tracker,
+            &store,
+            &adapter,
+            &config(),
+            crate::prompt::DEFAULT_TEMPLATE,
+            repo.path(),
+            NOW,
+            HOLDER,
+            |_| {},
+        )
+        .await;
+
+        assert!(
+            matches!(
+                report,
+                TickReport::Skipped {
+                    claim: SkipClaim::ClaimedThenReleased,
+                    ..
+                }
+            ),
+            "a gated-out advance must report that the claim was committed then released: {report:?}"
+        );
+        assert_eq!(
+            store.get("ITER-014").unwrap(),
+            None,
+            "the claim must have been durably released"
         );
     }
 }

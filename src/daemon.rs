@@ -13,9 +13,10 @@ use tokio::task::JoinHandle;
 use crate::adapter::AgentAdapter;
 use crate::config::{self, Config, ConfigError};
 use crate::mapping::{DagSource, MappingError, RoleMapping};
+use crate::projection::{EventKind, Projection};
 use crate::prompt;
 use crate::store::Store;
-use crate::tick::{RunRecord, TickReport, reconcile, run_tick};
+use crate::tick::{RunRecord, SkipClaim, TickReport, reconcile, run_tick};
 use crate::tracker::{Candidate, Tracker};
 
 const HOLDER: &str = "agentd";
@@ -232,6 +233,7 @@ where
         .map(Path::to_path_buf)
         .unwrap_or_else(|| store_dir.clone());
     let store_path = store_dir.join("store.redb");
+    let log_path = store_dir.join("log");
     let template = read_template(&repo, &config);
     let worker_state = state.clone();
 
@@ -240,8 +242,15 @@ where
             Ok(store) => store,
             Err(_) => return,
         };
+        let projection = Projection::new(log_path);
         let now = now_ms();
-        let _ = reconcile(&store, &tracker, now);
+        if let Ok(report) = reconcile(&store, &tracker, now) {
+            // A daemon restart, not a new commit: there is no live holder to
+            // attribute the release to, so the line carries only the id.
+            for id in &report.released {
+                projection.record(now, id, EventKind::ReconcileRelease, &[]);
+            }
+        }
 
         let running_state = worker_state.clone();
         let on_activated = move |candidate: &Candidate| {
@@ -265,10 +274,46 @@ where
         )
         .await;
 
-        if let TickReport::Dispatched(record) = report {
-            let mut state = worker_state.lock().unwrap();
-            state.running.retain(|item| item.id != record.id);
-            state.records.push(*record);
+        match report {
+            TickReport::Dispatched(record) => {
+                // Post-commit seam (ADR-002): the store transaction already
+                // committed inside `run_tick`/`claim_and_activate`; this only
+                // best-effort mirrors that outcome to the plain-text log.
+                projection.record(
+                    record.claimed_at_ms,
+                    &record.id,
+                    EventKind::Claim,
+                    &[("holder", &record.holder)],
+                );
+                if record.claim_released {
+                    projection.record(
+                        record.ended_at_ms,
+                        &record.id,
+                        EventKind::Release,
+                        &[("holder", &record.holder)],
+                    );
+                }
+
+                let mut state = worker_state.lock().unwrap();
+                state.running.retain(|item| item.id != record.id);
+                state.records.push(*record);
+            }
+            TickReport::Skipped { id, claim, .. } => {
+                // Same post-commit seam as above (STORY-019 AC1): a gated-out
+                // advance still durably claims-then-releases before the tick
+                // reports Skipped, so those commits must reach the log too. A
+                // lost claim never touched the store, so it logs nothing.
+                if matches!(
+                    claim,
+                    SkipClaim::ClaimedThenReleased | SkipClaim::ClaimedReleaseFailed
+                ) {
+                    projection.record(now, &id, EventKind::Claim, &[("holder", HOLDER)]);
+                }
+                if claim == SkipClaim::ClaimedThenReleased {
+                    projection.record(now, &id, EventKind::Release, &[("holder", HOLDER)]);
+                }
+            }
+            TickReport::Idle | TickReport::Error(_) => {}
         }
     })];
 
