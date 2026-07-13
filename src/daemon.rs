@@ -11,6 +11,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::config::{self, ConfigError};
+use crate::mapping::{DagSource, MappingError, RoleMapping};
 
 type SharedState = Arc<Mutex<DaemonState>>;
 
@@ -51,6 +52,7 @@ pub struct ItemView {
 #[derive(Debug)]
 pub enum DaemonError {
     Config(ConfigError),
+    Mapping(MappingError),
     AlreadyRunning(PathBuf),
     Bind { path: PathBuf, source: io::Error },
     Connect { path: PathBuf, source: io::Error },
@@ -62,6 +64,7 @@ impl fmt::Display for DaemonError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             DaemonError::Config(e) => write!(f, "{e}"),
+            DaemonError::Mapping(e) => write!(f, "invalid dispatch mapping: {e}"),
             DaemonError::AlreadyRunning(path) => {
                 write!(
                     f,
@@ -85,6 +88,7 @@ impl std::error::Error for DaemonError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             DaemonError::Config(e) => Some(e),
+            DaemonError::Mapping(e) => Some(e),
             DaemonError::Bind { source, .. } | DaemonError::Connect { source, .. } => Some(source),
             DaemonError::Io(e) => Some(e),
             DaemonError::AlreadyRunning(_) | DaemonError::Protocol(_) => None,
@@ -140,8 +144,15 @@ impl Daemon {
 }
 
 /// Validate config, bind the control socket, and run one immediate orchestrator tick.
-pub async fn start(config_path: &Path, socket_path: &Path) -> Result<Daemon, DaemonError> {
-    let _config = config::load(config_path).map_err(DaemonError::Config)?;
+pub async fn start(
+    config_path: &Path,
+    socket_path: &Path,
+    dag: &dyn DagSource,
+) -> Result<Daemon, DaemonError> {
+    let config = config::load(config_path).map_err(DaemonError::Config)?;
+    RoleMapping::from_config(&config)
+        .validate(dag)
+        .map_err(DaemonError::Mapping)?;
 
     let listener = bind_control_socket(socket_path).await?;
 
@@ -312,6 +323,7 @@ fn to_millis(t: SystemTime) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mapping::StubDag;
     use tempfile::TempDir;
 
     fn write_config(dir: &Path, body: &str) -> PathBuf {
@@ -326,7 +338,9 @@ mod tests {
         let config_path = write_config(dir.path(), "");
         let socket_path = dir.path().join("agentd.sock");
 
-        let daemon = start(&config_path, &socket_path).await.unwrap();
+        let daemon = start(&config_path, &socket_path, &StubDag::iteration())
+            .await
+            .unwrap();
         assert!(socket_path.exists());
         assert_eq!(daemon.workers_spawned(), 1);
 
@@ -347,7 +361,9 @@ mod tests {
         let config_path = write_config(dir.path(), "poll_interval_ms = 0");
         let socket_path = dir.path().join("agentd.sock");
 
-        let err = start(&config_path, &socket_path).await.unwrap_err();
+        let err = start(&config_path, &socket_path, &StubDag::iteration())
+            .await
+            .unwrap_err();
         assert!(matches!(err, DaemonError::Config(_)), "{err}");
         assert!(!socket_path.exists());
     }
@@ -358,8 +374,27 @@ mod tests {
         let config_path = dir.path().join("absent.toml");
         let socket_path = dir.path().join("agentd.sock");
 
-        let err = start(&config_path, &socket_path).await.unwrap_err();
+        let err = start(&config_path, &socket_path, &StubDag::iteration())
+            .await
+            .unwrap_err();
         assert!(matches!(err, DaemonError::Config(_)), "{err}");
+        assert!(!socket_path.exists());
+    }
+
+    #[tokio::test]
+    async fn mapping_referencing_a_missing_dag_state_aborts_and_leaves_no_socket() {
+        let dir = TempDir::new().unwrap();
+        let config_path = write_config(
+            dir.path(),
+            "[dispatch]\ntypes = [\"iteration\"]\n[dispatch.states]\nshipped = \"terminal\"\n",
+        );
+        let socket_path = dir.path().join("agentd.sock");
+
+        let err = start(&config_path, &socket_path, &StubDag::iteration())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DaemonError::Mapping(_)), "{err}");
+        assert!(err.to_string().contains("shipped"), "{err}");
         assert!(!socket_path.exists());
     }
 
@@ -369,7 +404,9 @@ mod tests {
         let config_path = write_config(dir.path(), "");
         let socket_path = dir.path().join("agentd.sock");
 
-        let daemon = start(&config_path, &socket_path).await.unwrap();
+        let daemon = start(&config_path, &socket_path, &StubDag::iteration())
+            .await
+            .unwrap();
         send_shutdown(&socket_path).await.unwrap();
         daemon.wait().await;
         daemon.shutdown().await;
@@ -384,7 +421,9 @@ mod tests {
         let socket_path = dir.path().join("agentd.sock");
         std::fs::write(&socket_path, b"stale").unwrap();
 
-        let daemon = start(&config_path, &socket_path).await.unwrap();
+        let daemon = start(&config_path, &socket_path, &StubDag::iteration())
+            .await
+            .unwrap();
         assert_eq!(query_status(&socket_path).await.unwrap().len(), 1);
         daemon.shutdown().await;
     }

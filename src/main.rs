@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 mod config;
 mod daemon;
 mod init;
+mod mapping;
 
 /// agentd — a git-like daemon that orchestrates coding agents against a lazyspec backlog.
 #[derive(Parser)]
@@ -78,7 +79,9 @@ async fn run_start() -> Result<(), String> {
     let config_path = store.join("config.toml");
     let socket_path = store.join("agentd.sock");
 
-    let daemon = daemon::start(&config_path, &socket_path)
+    let project_root = store.parent().unwrap_or(&store).to_path_buf();
+    let dag = mapping::LazyspecCli::new(project_root);
+    let daemon = daemon::start(&config_path, &socket_path, &dag)
         .await
         .map_err(|e| e.to_string())?;
     println!(

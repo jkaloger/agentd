@@ -1,7 +1,7 @@
 ---
 title: Config-driven type and state-role mapping
 type: story
-status: draft
+status: in-progress
 author: Jack Kaloger
 date: 2026-07-13
 tags: []

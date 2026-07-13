@@ -11,7 +11,7 @@ const DEFAULT_MAX_TURNS: u32 = 1;
 const DEFAULT_AUTO_APPROVE: bool = true;
 const DEFAULT_WORKSPACE_ROOT: &str = ".agentd/workspaces";
 const DEFAULT_PROMPT_TEMPLATE: &str = ".agentd/prompt.liquid";
-const DEFAULT_DISPATCH_TYPE: &str = "iteration";
+pub(crate) const DEFAULT_DISPATCH_TYPE: &str = "iteration";
 const DEFAULT_CLAIM: &str = "in-progress";
 const DEFAULT_SUCCESS: &str = "complete";
 const DEFAULT_FAILURE: &str = "rejected";
@@ -248,7 +248,7 @@ fn coerce_cap(value: &toml::Value) -> Option<u32> {
     u32::try_from(n).ok()
 }
 
-fn default_states() -> BTreeMap<String, StateRole> {
+pub(crate) fn default_states() -> BTreeMap<String, StateRole> {
     BTreeMap::from([
         ("accepted".to_string(), StateRole::Dispatch),
         ("in-progress".to_string(), StateRole::Active),
