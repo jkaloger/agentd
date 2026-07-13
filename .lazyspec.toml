@@ -12,41 +12,7 @@ singleton = false
 agents = []
 authorship = "assisted"
 attributes = []
-
-[types.lifecycle]
-states = [
-    "draft",
-    "review",
-    "accepted",
-    "in-progress",
-    "complete",
-    "rejected",
-    "superseded",
-]
-
-[[types.lifecycle.edges]]
-from = "draft"
-to = "review"
-
-[[types.lifecycle.edges]]
-from = "review"
-to = "accepted"
-
-[[types.lifecycle.edges]]
-from = "review"
-to = "rejected"
-
-[[types.lifecycle.edges]]
-from = "accepted"
-to = "in-progress"
-
-[[types.lifecycle.edges]]
-from = "in-progress"
-to = "complete"
-
-[[types.lifecycle.edges]]
-from = "*"
-to = "superseded"
+lifecycle = { states = ["draft", "review", "accepted", "in-progress", "complete", "rejected", "superseded"], edges = [{ from = "draft", to = "review" }, { from = "review", to = "accepted" }, { from = "review", to = "rejected" }, { from = "accepted", to = "in-progress" }, { from = "in-progress", to = "complete" }, { from = "*", to = "superseded" }] }
 
 [[types]]
 name = "bug"
@@ -62,35 +28,7 @@ singleton = false
 agents = []
 authorship = "assisted"
 attributes = []
-
-[types.lifecycle]
-states = [
-    "reported",
-    "triaged",
-    "in-progress",
-    "fixed",
-    "wontfix",
-]
-
-[[types.lifecycle.edges]]
-from = "reported"
-to = "triaged"
-
-[[types.lifecycle.edges]]
-from = "triaged"
-to = "in-progress"
-
-[[types.lifecycle.edges]]
-from = "in-progress"
-to = "fixed"
-
-[[types.lifecycle.edges]]
-from = "reported"
-to = "wontfix"
-
-[[types.lifecycle.edges]]
-from = "triaged"
-to = "wontfix"
+lifecycle = { states = ["reported", "triaged", "in-progress", "fixed", "wontfix"], edges = [{ from = "reported", to = "triaged" }, { from = "triaged", to = "in-progress" }, { from = "in-progress", to = "fixed" }, { from = "reported", to = "wontfix" }, { from = "triaged", to = "wontfix" }] }
 
 [[types]]
 name = "iteration"
@@ -106,41 +44,7 @@ singleton = false
 agents = []
 authorship = "generated"
 attributes = []
-
-[types.lifecycle]
-states = [
-    "draft",
-    "review",
-    "accepted",
-    "in-progress",
-    "complete",
-    "rejected",
-    "superseded",
-]
-
-[[types.lifecycle.edges]]
-from = "draft"
-to = "review"
-
-[[types.lifecycle.edges]]
-from = "review"
-to = "accepted"
-
-[[types.lifecycle.edges]]
-from = "review"
-to = "rejected"
-
-[[types.lifecycle.edges]]
-from = "accepted"
-to = "in-progress"
-
-[[types.lifecycle.edges]]
-from = "in-progress"
-to = "complete"
-
-[[types.lifecycle.edges]]
-from = "*"
-to = "superseded"
+lifecycle = { states = ["draft", "review", "accepted", "in-progress", "complete", "rejected", "superseded"], edges = [{ from = "draft", to = "review" }, { from = "review", to = "accepted" }, { from = "review", to = "rejected" }, { from = "accepted", to = "in-progress" }, { from = "in-progress", to = "complete" }, { from = "*", to = "superseded" }] }
 
 [[types]]
 name = "adr"
@@ -156,41 +60,7 @@ singleton = false
 agents = []
 authorship = "assisted"
 attributes = []
-
-[types.lifecycle]
-states = [
-    "draft",
-    "review",
-    "accepted",
-    "in-progress",
-    "complete",
-    "rejected",
-    "superseded",
-]
-
-[[types.lifecycle.edges]]
-from = "draft"
-to = "review"
-
-[[types.lifecycle.edges]]
-from = "review"
-to = "accepted"
-
-[[types.lifecycle.edges]]
-from = "review"
-to = "rejected"
-
-[[types.lifecycle.edges]]
-from = "accepted"
-to = "in-progress"
-
-[[types.lifecycle.edges]]
-from = "in-progress"
-to = "complete"
-
-[[types.lifecycle.edges]]
-from = "*"
-to = "superseded"
+lifecycle = { states = ["draft", "review", "accepted", "in-progress", "complete", "rejected", "superseded"], edges = [{ from = "draft", to = "review" }, { from = "review", to = "accepted" }, { from = "review", to = "rejected" }, { from = "accepted", to = "in-progress" }, { from = "in-progress", to = "complete" }, { from = "*", to = "superseded" }] }
 
 [[types]]
 name = "convention"
@@ -206,41 +76,7 @@ singleton = true
 agents = []
 authorship = "assisted"
 attributes = []
-
-[types.lifecycle]
-states = [
-    "draft",
-    "review",
-    "accepted",
-    "in-progress",
-    "complete",
-    "rejected",
-    "superseded",
-]
-
-[[types.lifecycle.edges]]
-from = "draft"
-to = "review"
-
-[[types.lifecycle.edges]]
-from = "review"
-to = "accepted"
-
-[[types.lifecycle.edges]]
-from = "review"
-to = "rejected"
-
-[[types.lifecycle.edges]]
-from = "accepted"
-to = "in-progress"
-
-[[types.lifecycle.edges]]
-from = "in-progress"
-to = "complete"
-
-[[types.lifecycle.edges]]
-from = "*"
-to = "superseded"
+lifecycle = { states = ["draft", "review", "accepted", "in-progress", "complete", "rejected", "superseded"], edges = [{ from = "draft", to = "review" }, { from = "review", to = "accepted" }, { from = "review", to = "rejected" }, { from = "accepted", to = "in-progress" }, { from = "in-progress", to = "complete" }, { from = "*", to = "superseded" }] }
 
 [[types]]
 name = "principle"
@@ -257,41 +93,16 @@ parent_type = "convention"
 agents = []
 authorship = "assisted"
 attributes = []
+lifecycle = { states = ["draft", "review", "accepted", "in-progress", "complete", "rejected", "superseded"], edges = [{ from = "draft", to = "review" }, { from = "review", to = "accepted" }, { from = "review", to = "rejected" }, { from = "accepted", to = "in-progress" }, { from = "in-progress", to = "complete" }, { from = "*", to = "superseded" }] }
 
-[types.lifecycle]
-states = [
-    "draft",
-    "review",
-    "accepted",
-    "in-progress",
-    "complete",
-    "rejected",
-    "superseded",
-]
-
-[[types.lifecycle.edges]]
-from = "draft"
-to = "review"
-
-[[types.lifecycle.edges]]
-from = "review"
-to = "accepted"
-
-[[types.lifecycle.edges]]
-from = "review"
-to = "rejected"
-
-[[types.lifecycle.edges]]
-from = "accepted"
-to = "in-progress"
-
-[[types.lifecycle.edges]]
-from = "in-progress"
-to = "complete"
-
-[[types.lifecycle.edges]]
-from = "*"
-to = "superseded"
+[[types]]
+name = "milestone"
+plural = "milestones"
+dir = "docs/milestones"
+prefix = "MILESTONE"
+icon = "🎯"
+intent = "Group work toward a dated, releasable outcome."
+lifecycle = { states = ["planned", "active", "complete", "cancelled"], edges = [{ from = "planned", to = "active" }, { from = "active", to = "complete" }, { from = "*", to = "cancelled" }] }
 
 [naming]
 pattern = "{type}-{n:03}-{title}.md"
@@ -315,6 +126,11 @@ inverse = "blocked-by"
 [[relationships]]
 name = "related-to"
 traversal = "related"
+
+[[relationships]]
+name = "targets"
+inverse = "targeted-by"
+traversal = "chain"
 
 [tui]
 ascii_diagrams = false
@@ -348,8 +164,6 @@ severity = "error"
 
 [certification]
 normalize = true
-
-[certification.overrides]
 
 [agents]
 

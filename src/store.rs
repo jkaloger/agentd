@@ -1,0 +1,261 @@
+use std::path::Path;
+use std::time::Duration;
+
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use serde::{Deserialize, Serialize};
+
+const CLAIMS: TableDefinition<&str, &[u8]> = TableDefinition::new("claims");
+
+/// A durable claim on an iteration: who holds it and when the lease expires.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimRecord {
+    pub holder: String,
+    pub due_at: u64,
+}
+
+#[derive(Debug)]
+pub enum ClaimError {
+    AlreadyClaimed(ClaimRecord),
+    Storage(redb::Error),
+    Encode(serde_json::Error),
+}
+
+#[derive(Debug)]
+pub enum StoreError {
+    Open(redb::Error),
+    Storage(redb::Error),
+    Decode(serde_json::Error),
+}
+
+/// The agentd durable store: a daemon-owned redb database.
+pub struct Store {
+    db: Database,
+}
+
+impl Store {
+    pub fn open(path: &Path) -> Result<Self, StoreError> {
+        let db = Database::create(path).map_err(|e| StoreError::Open(e.into()))?;
+        let txn = db.begin_write().map_err(storage)?;
+        txn.open_table(CLAIMS).map_err(storage)?;
+        txn.commit().map_err(storage)?;
+        Ok(Self { db })
+    }
+
+    /// Claim `id` for `holder` iff it is unclaimed or its lease has expired.
+    ///
+    /// The read-check-write runs inside one redb write transaction, which redb
+    /// serializes against all other writers — so racing callers cannot both
+    /// observe the id as free.
+    pub fn claim(
+        &self,
+        id: &str,
+        holder: &str,
+        now: u64,
+        lease_ttl: Duration,
+    ) -> Result<ClaimRecord, ClaimError> {
+        let txn = self.db.begin_write().map_err(claim_storage)?;
+        let record = {
+            let mut table = txn.open_table(CLAIMS).map_err(claim_storage)?;
+
+            if let Some(existing) = table.get(id).map_err(claim_storage)? {
+                let existing: ClaimRecord =
+                    serde_json::from_slice(existing.value()).map_err(ClaimError::Encode)?;
+                if existing.due_at > now {
+                    return Err(ClaimError::AlreadyClaimed(existing));
+                }
+            }
+
+            let record = ClaimRecord {
+                holder: holder.to_string(),
+                due_at: now + lease_ttl.as_millis() as u64,
+            };
+            let bytes = serde_json::to_vec(&record).map_err(ClaimError::Encode)?;
+            table.insert(id, bytes.as_slice()).map_err(claim_storage)?;
+            record
+        };
+        txn.commit().map_err(claim_storage)?;
+        Ok(record)
+    }
+
+    /// Every persisted claim as `(id, record)`. Used by `reconcile` on restart to
+    /// find claims orphaned by a dead daemon.
+    pub fn claims(&self) -> Result<Vec<(String, ClaimRecord)>, StoreError> {
+        let txn = self.db.begin_read().map_err(storage)?;
+        let table = txn.open_table(CLAIMS).map_err(storage)?;
+        let mut claims = Vec::new();
+        for entry in table.iter().map_err(storage)? {
+            let (key, value) = entry.map_err(storage)?;
+            let record = serde_json::from_slice(value.value()).map_err(StoreError::Decode)?;
+            claims.push((key.value().to_string(), record));
+        }
+        Ok(claims)
+    }
+
+    pub fn get(&self, id: &str) -> Result<Option<ClaimRecord>, StoreError> {
+        let txn = self.db.begin_read().map_err(storage)?;
+        let table = txn.open_table(CLAIMS).map_err(storage)?;
+        match table.get(id).map_err(storage)? {
+            Some(value) => {
+                let record = serde_json::from_slice(value.value()).map_err(StoreError::Decode)?;
+                Ok(Some(record))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Drop any claim on `id`, freeing it for a later attempt. Idempotent: a
+    /// missing claim is not an error.
+    pub fn release(&self, id: &str) -> Result<(), StoreError> {
+        let txn = self.db.begin_write().map_err(storage)?;
+        {
+            let mut table = txn.open_table(CLAIMS).map_err(storage)?;
+            table.remove(id).map_err(storage)?;
+        }
+        txn.commit().map_err(storage)?;
+        Ok(())
+    }
+}
+
+fn storage(e: impl Into<redb::Error>) -> StoreError {
+    StoreError::Storage(e.into())
+}
+
+fn claim_storage(e: impl Into<redb::Error>) -> ClaimError {
+    ClaimError::Storage(e.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    const TTL: Duration = Duration::from_secs(60);
+
+    fn open(dir: &TempDir) -> Store {
+        Store::open(&dir.path().join("claims.redb")).unwrap()
+    }
+
+    #[test]
+    fn fresh_claim_writes_one_row_and_returns_it() {
+        let dir = TempDir::new().unwrap();
+        let store = open(&dir);
+
+        let record = store.claim("ITER-007", "agent-a", 1000, TTL).unwrap();
+        assert_eq!(record.holder, "agent-a");
+        assert_eq!(record.due_at, 1000 + 60_000);
+
+        assert_eq!(store.get("ITER-007").unwrap(), Some(record));
+    }
+
+    #[test]
+    fn concurrent_claims_for_same_id_yield_exactly_one_winner() {
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(open(&dir));
+        let n = 16;
+
+        let barrier = Arc::new(std::sync::Barrier::new(n));
+        let handles: Vec<_> = (0..n)
+            .map(|i| {
+                let store = store.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store.claim("ITER-007", &format!("agent-{i}"), 1000, TTL)
+                })
+            })
+            .collect();
+
+        let mut winners = 0;
+        for handle in handles {
+            match handle.join().unwrap() {
+                Ok(_) => winners += 1,
+                Err(ClaimError::AlreadyClaimed(_)) => {}
+                Err(other) => panic!("unexpected error: {other:?}"),
+            }
+        }
+        assert_eq!(winners, 1);
+    }
+
+    #[test]
+    fn live_lease_blocks_a_second_holder() {
+        let dir = TempDir::new().unwrap();
+        let store = open(&dir);
+
+        let first = store.claim("ITER-007", "agent-a", 1000, TTL).unwrap();
+        let err = store
+            .claim("ITER-007", "agent-b", 2000, TTL)
+            .expect_err("live lease must not be overwritten");
+        match err {
+            ClaimError::AlreadyClaimed(held) => assert_eq!(held, first),
+            other => panic!("expected AlreadyClaimed, got {other:?}"),
+        }
+        assert_eq!(store.get("ITER-007").unwrap().unwrap().holder, "agent-a");
+    }
+
+    #[test]
+    fn expired_lease_can_be_reclaimed_by_a_new_holder() {
+        let dir = TempDir::new().unwrap();
+        let store = open(&dir);
+
+        let first = store.claim("ITER-007", "agent-a", 1000, TTL).unwrap();
+        let now = first.due_at + 1;
+        let second = store.claim("ITER-007", "agent-b", now, TTL).unwrap();
+
+        assert_eq!(second.holder, "agent-b");
+        assert_eq!(store.get("ITER-007").unwrap(), Some(second));
+    }
+
+    #[test]
+    fn release_drops_the_claim_and_frees_it_for_a_live_reclaim() {
+        let dir = TempDir::new().unwrap();
+        let store = open(&dir);
+
+        store.claim("ITER-007", "agent-a", 1000, TTL).unwrap();
+        store.release("ITER-007").unwrap();
+        assert_eq!(store.get("ITER-007").unwrap(), None);
+
+        let reclaimed = store.claim("ITER-007", "agent-b", 2000, TTL).unwrap();
+        assert_eq!(reclaimed.holder, "agent-b");
+    }
+
+    #[test]
+    fn release_of_an_unclaimed_id_is_a_no_op() {
+        let dir = TempDir::new().unwrap();
+        let store = open(&dir);
+
+        store.release("ITER-007").unwrap();
+        assert_eq!(store.get("ITER-007").unwrap(), None);
+    }
+
+    #[test]
+    fn claims_lists_every_persisted_row() {
+        let dir = TempDir::new().unwrap();
+        let store = open(&dir);
+
+        store.claim("ITER-001", "agent-a", 1000, TTL).unwrap();
+        store.claim("ITER-002", "agent-b", 1000, TTL).unwrap();
+
+        let mut claims = store.claims().unwrap();
+        claims.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(claims.len(), 2);
+        assert_eq!(claims[0].0, "ITER-001");
+        assert_eq!(claims[0].1.holder, "agent-a");
+        assert_eq!(claims[1].0, "ITER-002");
+        assert_eq!(claims[1].1.holder, "agent-b");
+    }
+
+    #[test]
+    fn committed_claim_survives_reopen_and_reads_identically() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("claims.redb");
+
+        let written = {
+            let store = Store::open(&path).unwrap();
+            store.claim("ITER-007", "agent-a", 1000, TTL).unwrap()
+        };
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.get("ITER-007").unwrap(), Some(written));
+    }
+}
