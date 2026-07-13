@@ -6,11 +6,13 @@ use serde::{Deserialize, Serialize};
 
 const CLAIMS: TableDefinition<&str, &[u8]> = TableDefinition::new("claims");
 
-/// A durable claim on an iteration: who holds it and when the lease expires.
+/// A durable claim on an iteration: who holds it, when the lease expires, and
+/// a fence that a heartbeat must present to prove it still owns that lease.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaimRecord {
     pub holder: String,
     pub due_at: u64,
+    pub fence: u64,
 }
 
 #[derive(Debug)]
@@ -24,6 +26,17 @@ pub enum ClaimError {
 pub enum StoreError {
     Open(redb::Error),
     Storage(redb::Error),
+    Decode(serde_json::Error),
+}
+
+#[derive(Debug)]
+pub enum HeartbeatError {
+    /// No claim exists at all for the given id.
+    NotFound,
+    /// A claim exists but its holder or fence does not match the caller's.
+    Mismatch(ClaimRecord),
+    Storage(redb::Error),
+    Encode(serde_json::Error),
     Decode(serde_json::Error),
 }
 
@@ -68,12 +81,54 @@ impl Store {
             let record = ClaimRecord {
                 holder: holder.to_string(),
                 due_at: now + lease_ttl.as_millis() as u64,
+                fence: 1,
             };
             let bytes = serde_json::to_vec(&record).map_err(ClaimError::Encode)?;
             table.insert(id, bytes.as_slice()).map_err(claim_storage)?;
             record
         };
         txn.commit().map_err(claim_storage)?;
+        Ok(record)
+    }
+
+    /// Extend a live claim's lease. Rejects (without writing) unless `holder`
+    /// and `fence` both match the stored record — a stale or impersonating
+    /// caller cannot renew a lease it does not hold.
+    pub fn heartbeat(
+        &self,
+        id: &str,
+        holder: &str,
+        fence: u64,
+        now: u64,
+        lease_ttl: Duration,
+    ) -> Result<ClaimRecord, HeartbeatError> {
+        let txn = self.db.begin_write().map_err(heartbeat_storage)?;
+        let record = {
+            let mut table = txn.open_table(CLAIMS).map_err(heartbeat_storage)?;
+
+            let existing: ClaimRecord = {
+                let value = table
+                    .get(id)
+                    .map_err(heartbeat_storage)?
+                    .ok_or(HeartbeatError::NotFound)?;
+                serde_json::from_slice(value.value()).map_err(HeartbeatError::Decode)?
+            };
+            if existing.holder != holder || existing.fence != fence {
+                return Err(HeartbeatError::Mismatch(existing));
+            }
+
+            let record = ClaimRecord {
+                holder: existing.holder,
+                due_at: now + lease_ttl.as_millis() as u64,
+                fence: existing.fence,
+            };
+            let bytes = serde_json::to_vec(&record).map_err(HeartbeatError::Encode)?;
+            table
+                .insert(id, bytes.as_slice())
+                .map_err(heartbeat_storage)?;
+            record
+        };
+        txn.commit().map_err(heartbeat_storage)?;
         Ok(record)
     }
 
@@ -122,6 +177,10 @@ fn storage(e: impl Into<redb::Error>) -> StoreError {
 
 fn claim_storage(e: impl Into<redb::Error>) -> ClaimError {
     ClaimError::Storage(e.into())
+}
+
+fn heartbeat_storage(e: impl Into<redb::Error>) -> HeartbeatError {
+    HeartbeatError::Storage(e.into())
 }
 
 #[cfg(test)]
@@ -243,6 +302,90 @@ mod tests {
         assert_eq!(claims[0].1.holder, "agent-a");
         assert_eq!(claims[1].0, "ITER-002");
         assert_eq!(claims[1].1.holder, "agent-b");
+    }
+
+    #[test]
+    fn fresh_claim_carries_fence_one() {
+        let dir = TempDir::new().unwrap();
+        let store = open(&dir);
+
+        let record = store.claim("ITER-007", "agent-a", 1000, TTL).unwrap();
+        assert_eq!(record.fence, 1);
+    }
+
+    #[test]
+    fn heartbeat_extends_the_lease_in_a_durable_transaction() {
+        let dir = TempDir::new().unwrap();
+        let store = open(&dir);
+
+        let claimed = store.claim("ITER-007", "agent-a", 1000, TTL).unwrap();
+        let renewed = store
+            .heartbeat("ITER-007", "agent-a", claimed.fence, 5000, TTL)
+            .unwrap();
+
+        assert_eq!(renewed.due_at, 5000 + 60_000);
+        assert_eq!(renewed.holder, "agent-a");
+        assert_eq!(renewed.fence, claimed.fence);
+        assert_eq!(store.get("ITER-007").unwrap(), Some(renewed));
+    }
+
+    #[test]
+    fn heartbeat_rejects_a_holder_mismatch() {
+        let dir = TempDir::new().unwrap();
+        let store = open(&dir);
+
+        let claimed = store.claim("ITER-007", "agent-a", 1000, TTL).unwrap();
+        let err = store
+            .heartbeat("ITER-007", "agent-b", claimed.fence, 5000, TTL)
+            .expect_err("mismatched holder must be rejected");
+        match err {
+            HeartbeatError::Mismatch(held) => assert_eq!(held, claimed),
+            other => panic!("expected Mismatch, got {other:?}"),
+        }
+        assert_eq!(store.get("ITER-007").unwrap(), Some(claimed));
+    }
+
+    #[test]
+    fn heartbeat_rejects_a_fence_mismatch() {
+        let dir = TempDir::new().unwrap();
+        let store = open(&dir);
+
+        let claimed = store.claim("ITER-007", "agent-a", 1000, TTL).unwrap();
+        let err = store
+            .heartbeat("ITER-007", "agent-a", claimed.fence + 1, 5000, TTL)
+            .expect_err("mismatched fence must be rejected");
+        match err {
+            HeartbeatError::Mismatch(held) => assert_eq!(held, claimed),
+            other => panic!("expected Mismatch, got {other:?}"),
+        }
+        assert_eq!(store.get("ITER-007").unwrap(), Some(claimed));
+    }
+
+    #[test]
+    fn heartbeat_on_an_absent_claim_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let store = open(&dir);
+
+        let err = store
+            .heartbeat("ITER-007", "agent-a", 1, 1000, TTL)
+            .expect_err("heartbeat on an absent claim must be rejected");
+        match err {
+            HeartbeatError::NotFound => {}
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn expired_lease_stays_present_and_observable_via_get() {
+        let dir = TempDir::new().unwrap();
+        let store = open(&dir);
+
+        let claimed = store.claim("ITER-007", "agent-a", 1000, TTL).unwrap();
+        let now = claimed.due_at + 1;
+
+        let still_there = store.get("ITER-007").unwrap().unwrap();
+        assert_eq!(still_there, claimed);
+        assert!(still_there.due_at <= now);
     }
 
     #[test]
