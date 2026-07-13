@@ -1,0 +1,17 @@
+[package]
+name = "agentd"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+
+[dependencies]
+clap = { version = "4.6.1", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "process", "net", "macros"] }
+toml = "1.1.2"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+
+[lints.rust]
+warnings = "deny"
