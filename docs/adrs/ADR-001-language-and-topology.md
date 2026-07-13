@@ -10,13 +10,13 @@ related:
 ---## Context
 
 agentd is a unix, git-like daemon that orchestrates coding agents against a lazyspec
-backlog. It is modelled on the Symphony service spec (`SPEC.md`) but must feel like a
+backlog. It is modelled on a prior orchestration design (`SPEC.md`) but must feel like a
 first-class CLI: a human at a terminal and a script get the same interface, and `status` /
 `log` behave like their git counterparts.
 
 Two coupled foundational choices gate everything else: the implementation language and the
 CLI↔daemon topology. Candidates considered: Rust, Go, Elixir/OTP. Elixir's supervision tree
-maps cleanly onto Symphony's orchestrator/worker/retry model and would nearly give the SSH
+maps cleanly onto the orchestrator/worker/retry model in `SPEC.md` and would nearly give the SSH
 worker extension (SPEC Appendix A) for free, but it has no true static binary and BEAM boot
 latency undermines a snappy git-like CLI. Go ships a daemon fastest but has the weakest types
 for proving the leasing/state-machine invariants. Rust gives a single static binary,
@@ -50,5 +50,5 @@ authenticated, filesystem-permissioned channel rather than a second network list
   offline inspectability is delivered by the text projection in [[adr-002-durable-state-and-leasing]].
 - No HTTP surface to secure or operate; access control reduces to socket file permissions, and
   scripting goes through the same porcelain a human uses.
-- Diverges from Symphony's language-agnostic framing by committing to Rust; the abstraction
+- Diverges from `SPEC.md`'s language-agnostic framing by committing to Rust; the abstraction
   layers of SPEC §3.2 are preserved as Rust module boundaries.

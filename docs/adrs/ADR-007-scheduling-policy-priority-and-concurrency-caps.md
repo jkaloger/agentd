@@ -11,7 +11,7 @@ related:
 
 ## Context
 
-ADR-001 fixes the orchestrator as the single authority that supervises per-ticket workers, but it does not decide the *policy* that authority applies when work outstrips capacity. Symphony (SPEC §8.2, §8.3) sorts eligible work by priority then age and caps concurrency both globally and per active-state. agentd inherited those behaviours as stories (priority ordering, global cap, per-status cap) with no ADR sanctioning them — a decision made in code by default rather than on the record.
+ADR-001 fixes the orchestrator as the single authority that supervises per-ticket workers, but it does not decide the *policy* that authority applies when work outstrips capacity. SPEC §8.2, §8.3 sorts eligible work by priority then age and caps concurrency both globally and per active-state. agentd inherited those behaviours as stories (priority ordering, global cap, per-status cap) with no ADR sanctioning them — a decision made in code by default rather than on the record.
 
 ## Decision
 

@@ -12,8 +12,8 @@ related:
 
 ## Context
 
-Symphony puts all runtime config plus the per-issue prompt in one repo-owned `WORKFLOW.md`
-(YAML front matter + Liquid body) with hot-reload (SPEC §5, §6.2). agentd must configure poll
+SPEC §5, §6.2 puts all runtime config plus the per-issue prompt in one repo-owned `WORKFLOW.md`
+(YAML front matter + Liquid body) with hot-reload. agentd must configure poll
 interval, concurrency, agent kind + settings, workspace/isolation, hooks, the config-driven
 dispatch type/state mapping ([[adr-003-work-source-lazyspec]]), lifecycle transition mapping,
 and a per-ticket prompt.
@@ -51,7 +51,7 @@ tenet holds.
 
 - Clean config/prompt separation; TOML matches the ecosystem and the lazyspec sibling file.
 - Hot-reload lets operators retune concurrency/interval/prompt without restart.
-- Two watched inputs (config + prompt) instead of Symphony's one file.
+- Two watched inputs (config + prompt) instead of one combined file.
 - Porcelain gives humans and scripts the same interface; manual override is operator-friendly
   without violating leasing, which stays owned by the store in
   [[adr-002-durable-state-and-leasing]].

@@ -11,7 +11,7 @@ related:
 
 ## Context
 
-Symphony keeps scheduler state entirely in memory and recovers by re-polling the tracker
+The prior orchestration design keeps scheduler state entirely in memory and recovers by re-polling the tracker
 (SPEC §14.3: no retry timers, running sessions, or worker state survive restart). agentd's
 constitution rejects that: *"state is inspectable and work is resumable — a crashed agent or
 daemon must not lose or double-assign a ticket."* That promise requires durable, atomic claim
@@ -26,8 +26,8 @@ while the daemon holds it.
 ## Decision
 
 We will split source-of-truth: **lazyspec is the truth for _what work exists_** (re-read each
-tick, like Symphony re-polls Linear), and the **agentd store is the truth for _what is
-claimed / running / attempted_** — the state Symphony discards and we keep.
+tick, like the prior design re-polls Linear), and the **agentd store is the truth for _what is
+claimed / running / attempted_** — the state that design discards and we keep.
 
 The store is **redb** (pure-Rust, embedded, ACID), owned solely by the daemon. A claim is a
 single ACID compare-and-set transaction on a `claims` table — claim iff absent or lease-expired
