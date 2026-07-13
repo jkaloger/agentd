@@ -1,0 +1,70 @@
+# agentd configuration — policy for orchestrating coding agents against a
+# lazyspec backlog. This file is a sibling to .lazyspec.toml and is hot-reloaded:
+# edits re-apply to future dispatch, retry, and launch decisions; in-flight runs
+# are left untouched, and an invalid reload keeps the last-known-good config.
+#
+# Every value below is the shipped default. Uncomment and change to override.
+
+# How often the daemon polls lazyspec for dispatchable work, in milliseconds.
+# Pickup latency is bounded by this interval.
+poll_interval_ms = 5000
+
+# Hard ceiling on concurrently running agents. Protects the host; when full,
+# further eligible work waits. Freeing a slot re-evaluates the whole eligible set.
+max_concurrent = 2
+
+[agent]
+# Which agent adapter to drive. Adapter order is claude -> codex -> opencode.
+kind = "claude"
+
+# Upper bound on the in-worker continuation loop. The claude adapter runs
+# one-shot turns (effectively 1-plus-redispatch); persistent adapters enforce
+# this as a real per-session turn ceiling.
+max_turns = 1
+
+# High-trust, non-interactive posture: auto-approve commands and edits, and
+# treat input-required as failure rather than blocking. Set false for a stricter
+# operator-approval mode.
+auto_approve = true
+
+[workspace]
+# "worktree" isolates each ticket in a git worktree branched off the current repo.
+# "plain-dir" is the fallback for non-git projects.
+mode = "worktree"
+
+# Root under which per-ticket working trees are created.
+root = ".agentd/workspaces"
+
+[dispatch]
+# Which lazyspec document type(s) are dispatchable tickets.
+types = ["iteration"]
+
+# Map each lifecycle state to an orchestration role:
+#   dispatch — eligible to be claimed and started
+#   active   — claimed / in-progress (resumable)
+#   terminal — done, no further dispatch
+[dispatch.states]
+accepted = "dispatch"
+"in-progress" = "active"
+complete = "terminal"
+rejected = "terminal"
+superseded = "terminal"
+
+# Lifecycle transitions the daemon drives via `lazyspec advance`.
+[transitions]
+# On claim: dispatch-eligible -> active.
+claim = "in-progress"
+# On clean success.
+success = "complete"
+# On failure.
+failure = "rejected"
+
+# Optional per-active-state concurrency caps. When unset for a state, that state
+# falls back to the global max_concurrent. Caps are advisory ceilings.
+[concurrency.per_status]
+# "in-progress" = 2
+
+[prompt]
+# Path to the strict-rendered prompt template (unknown variable/filter fails
+# rendering). Relative to the repo root.
+template = ".agentd/prompt.liquid"

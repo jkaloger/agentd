@@ -1,5 +1,7 @@
 use clap::{Parser, Subcommand};
 
+mod init;
+
 /// agentd — a git-like daemon that orchestrates coding agents against a lazyspec backlog.
 #[derive(Parser)]
 #[command(name = "agentd", version, about, long_about = None)]
@@ -50,8 +52,41 @@ impl Command {
 }
 
 fn run(command: Command) -> Result<(), String> {
-    println!("unimplemented: {}", command.name());
-    Ok(())
+    match command {
+        Command::Init => run_init(),
+        other => {
+            println!("unimplemented: {}", other.name());
+            Ok(())
+        }
+    }
+}
+
+fn run_init() -> Result<(), String> {
+    let root =
+        std::env::current_dir().map_err(|e| format!("cannot determine current directory: {e}"))?;
+    match init::init(&root) {
+        Ok(report) if report.already_initialized() => {
+            println!("agentd already initialized at {}", report.store.display());
+            for path in &report.existing {
+                println!("  exists: {}", path.display());
+            }
+            Ok(())
+        }
+        Ok(report) => {
+            println!("Initialized agentd store at {}", report.store.display());
+            for path in &report.created {
+                println!("  created: {}", path.display());
+            }
+            for path in &report.existing {
+                println!("  exists (kept): {}", path.display());
+            }
+            Ok(())
+        }
+        Err(e) => Err(format!(
+            "failed to initialize agentd store in {}: {e}",
+            root.display()
+        )),
+    }
 }
 
 #[tokio::main]
@@ -88,7 +123,9 @@ mod tests {
         for args in cases {
             let cli = Cli::try_parse_from(*args)
                 .unwrap_or_else(|e| panic!("failed to parse {args:?}: {e}"));
-            run(cli.command).unwrap();
+            if !matches!(cli.command, Command::Init) {
+                run(cli.command).unwrap();
+            }
         }
     }
 }
