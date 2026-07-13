@@ -42,6 +42,20 @@ pub struct DocView {
     pub doc_type: String,
     pub title: String,
     pub body: String,
+    pub status: String,
+}
+
+/// The outcome of looking a claim's document up in lazyspec during reconcile.
+///
+/// `Absent` (lazyspec authoritatively reports no such document) and a read
+/// failure (a `TrackerError` — CLI spawn/exec/parse fault) are deliberately
+/// distinct: an absent doc means the work is gone and its claim can be dropped,
+/// whereas a read failure tells us nothing about the work, so reconcile must
+/// leave every claim untouched and retry next cycle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DocLookup {
+    Present(DocView),
+    Absent,
 }
 
 /// The work-source seam. lazyspec is the only implementation today; the SPEC's
@@ -52,6 +66,12 @@ pub trait Tracker {
     /// Fetch one document's context (`lazyspec show <id> --json`) — the seam the
     /// prompt assembler uses to pull an iteration's immediate parent.
     fn fetch_doc(&self, id: &str) -> Result<DocView, TrackerError>;
+
+    /// Look a claim's document up for reconcile, distinguishing a doc that
+    /// lazyspec reports as not-found (`DocLookup::Absent`) from a read failure
+    /// (`Err`). The distinction is the whole point of the seam: reconcile drops
+    /// a claim for an absent doc but stays conservative on a read failure.
+    fn lookup_doc(&self, id: &str) -> Result<DocLookup, TrackerError>;
 
     /// Move a document to `target_state` through lazyspec's gated lifecycle
     /// (the daemon owns transitions, per ADR-003). Modelled as
@@ -126,6 +146,16 @@ impl<R: CommandRunner> Tracker for LazyspecTracker<R> {
     fn fetch_doc(&self, id: &str) -> Result<DocView, TrackerError> {
         let shown = self.runner.run(&["show", id, "--json"])?;
         parse_doc_view(id, &shown)
+    }
+
+    fn lookup_doc(&self, id: &str) -> Result<DocLookup, TrackerError> {
+        match self.runner.run(&["show", id, "--json"]) {
+            Ok(shown) => Ok(DocLookup::Present(parse_doc_view(id, &shown)?)),
+            // lazyspec's only signal for a missing document is a non-zero exit
+            // whose stderr names it; anything else is a genuine read failure.
+            Err(CliFailure::Exit { stderr, .. }) if is_not_found(&stderr) => Ok(DocLookup::Absent),
+            Err(failure) => Err(failure.into()),
+        }
     }
 
     fn advance(&self, id: &str, target_state: &str) -> Result<(), TrackerError> {
@@ -208,7 +238,12 @@ fn parse_doc_view(id: &str, json: &[u8]) -> Result<DocView, TrackerError> {
         doc_type: shown.doc_type,
         title: shown.title,
         body: shown.body,
+        status: shown.status,
     })
+}
+
+fn is_not_found(stderr: &str) -> bool {
+    stderr.contains("not found")
 }
 
 #[derive(Deserialize)]
@@ -243,6 +278,8 @@ struct ShownDoc {
     doc_type: String,
     #[serde(default)]
     body: String,
+    #[serde(default)]
+    status: String,
 }
 
 #[derive(Debug)]
@@ -426,6 +463,73 @@ mod tests {
         assert_eq!(doc.doc_type, "story");
         assert_eq!(doc.title, "Assemble prompt");
         assert_eq!(doc.body, "As an operator...");
+    }
+
+    /// A runner whose `show` call fails with a chosen exit, used to exercise the
+    /// absent-vs-read-failure split in `lookup_doc`.
+    struct FailingShow {
+        failure: CliFailure,
+    }
+
+    impl CommandRunner for FailingShow {
+        fn run(&self, _args: &[&str]) -> Result<Vec<u8>, CliFailure> {
+            match &self.failure {
+                CliFailure::Exit { code, stderr } => Err(CliFailure::Exit {
+                    code: *code,
+                    stderr: stderr.clone(),
+                }),
+                CliFailure::Spawn(_) => Err(CliFailure::Spawn(io::Error::other("spawn"))),
+            }
+        }
+    }
+
+    #[test]
+    fn lookup_doc_returns_present_with_the_parsed_status() {
+        let tracker = LazyspecTracker::new(
+            FakeCli::ok(r#"{"documents":[]}"#).with_body(
+                "ITER-014",
+                r#"{"id":"ITER-014","type":"iteration","title":"T","body":"B","status":"in-progress"}"#,
+            ),
+            RoleMapping::adr003_default(),
+        );
+
+        let lookup = tracker.lookup_doc("ITER-014").unwrap();
+
+        match lookup {
+            DocLookup::Present(view) => assert_eq!(view.status, "in-progress"),
+            DocLookup::Absent => panic!("expected Present"),
+        }
+    }
+
+    #[test]
+    fn lookup_doc_maps_a_not_found_exit_to_absent() {
+        let tracker = LazyspecTracker::new(
+            FailingShow {
+                failure: CliFailure::Exit {
+                    code: Some(1),
+                    stderr: "Error: document not found: ITER-014".to_string(),
+                },
+            },
+            RoleMapping::adr003_default(),
+        );
+
+        assert_eq!(tracker.lookup_doc("ITER-014").unwrap(), DocLookup::Absent);
+    }
+
+    #[test]
+    fn lookup_doc_surfaces_other_failures_as_read_errors() {
+        let tracker = LazyspecTracker::new(
+            FailingShow {
+                failure: CliFailure::Exit {
+                    code: Some(2),
+                    stderr: "Error: config parse failed".to_string(),
+                },
+            },
+            RoleMapping::adr003_default(),
+        );
+
+        let err = tracker.lookup_doc("ITER-014").unwrap_err();
+        assert!(matches!(err, TrackerError::Command { .. }), "{err}");
     }
 
     #[test]

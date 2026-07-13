@@ -1,7 +1,7 @@
 ---
 title: Reconcile claims against lazyspec and worktrees
 type: story
-status: accepted
+status: in-progress
 author: Jack Kaloger
 date: 2026-07-13
 tags: []

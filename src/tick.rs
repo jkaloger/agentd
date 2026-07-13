@@ -1,15 +1,16 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::adapter::{AgentAdapter, TurnOutcome};
 use crate::agent::AgentEvent;
-use crate::config::Config;
+use crate::config::{Config, StateRole};
 use crate::dispatch::{DispatchError, claim_and_activate};
+use crate::mapping::RoleMapping;
 use crate::prompt::assemble_prompt;
 use crate::resolve::{OutcomeBranch, ResolvedTransition, resolve_outcome};
 use crate::store::{ClaimRecord, Store, StoreError};
-use crate::tracker::{Candidate, Tracker, TrackerError};
+use crate::tracker::{Candidate, DocLookup, Tracker, TrackerError};
 use crate::workspace::{Worktree, prepare_worktree};
 
 /// How long a claim's lease is held before it is considered orphaned and
@@ -340,12 +341,18 @@ fn fail_before_agent<T: Tracker>(
     }))
 }
 
-/// What a restart's reconcile resolved (STORY-060 AC4).
+/// What a restart's reconcile resolved (STORY-060 AC4, STORY-017).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReconcileReport {
-    /// Expired orphan claims that were released.
+    /// Expired orphan claims that were released (STORY-016).
     pub released: Vec<String>,
-    /// Still-live leases left in place.
+    /// Live-lease claims whose document lazyspec no longer has: dropped as work
+    /// that has vanished (STORY-017 AC1).
+    pub dropped: Vec<String>,
+    /// Live-lease claims whose document lazyspec reports terminal-complete:
+    /// finalized, released without re-dispatch (STORY-017 AC2).
+    pub finalized: Vec<String>,
+    /// Live leases whose document is still active, left in place (STORY-017 AC3).
     pub retained: Vec<String>,
     /// Released ids the tracker would still offer as fresh — the double-dispatch
     /// risk. Must be empty: an item mid-run sits in an active (non-dispatch)
@@ -370,16 +377,27 @@ impl std::fmt::Display for ReconcileError {
 
 impl std::error::Error for ReconcileError {}
 
-/// Reconcile the durable store on daemon start, before any tick (STORY-060 AC4).
+/// Reconcile the durable store on daemon start, before any tick (STORY-060 AC4,
+/// STORY-017).
 ///
-/// Every claim persisted across a restart was made by a now-dead daemon, so any
-/// whose lease has expired is an orphan and is released. The tracker's current
-/// dispatch set is consulted to attest the invariant: a released id is never
-/// simultaneously dispatch-eligible, so a restart cannot double-dispatch an
-/// in-flight item.
+/// Every claim persisted across a restart was made by a now-dead daemon. A claim
+/// whose lease has expired is an orphan and is released regardless (STORY-016).
+/// A claim whose lease is still live is cross-checked against lazyspec, the truth
+/// for what work exists (ADR-002):
+/// - the document is absent → drop the claim, its work has vanished (AC1);
+/// - the document is terminal-complete → finalize, release without re-dispatch (AC2);
+/// - the document is still active → retain the claim (AC3).
+///
+/// If lazyspec cannot be read, reconcile mutates nothing and returns an error so
+/// the next cycle retries (AC4): every lazyspec read happens before any store
+/// write, so a read failure leaves all claims — orphans included — untouched.
+///
+/// The tracker's current dispatch set attests the invariant that a released id is
+/// never simultaneously dispatch-eligible, so a restart cannot double-dispatch.
 pub fn reconcile<T: Tracker>(
     store: &Store,
     tracker: &T,
+    mapping: &RoleMapping,
     now: u64,
 ) -> Result<ReconcileReport, ReconcileError> {
     let dispatchable: BTreeSet<String> = tracker
@@ -390,7 +408,20 @@ pub fn reconcile<T: Tracker>(
         .collect();
 
     let claims = store.claims().map_err(ReconcileError::Store)?;
+
+    // Read every live lease's lazyspec state before touching the store: a read
+    // failure here must leave the whole store untouched so the next cycle retries.
+    let mut lookups: BTreeMap<String, DocLookup> = BTreeMap::new();
+    for (id, record) in &claims {
+        if record.due_at > now {
+            let lookup = tracker.lookup_doc(id).map_err(ReconcileError::Tracker)?;
+            lookups.insert(id.clone(), lookup);
+        }
+    }
+
     let mut released = Vec::new();
+    let mut dropped = Vec::new();
+    let mut finalized = Vec::new();
     let mut retained = Vec::new();
     let mut re_offered = Vec::new();
 
@@ -401,13 +432,32 @@ pub fn reconcile<T: Tracker>(
                 re_offered.push(id.clone());
             }
             released.push(id);
-        } else {
-            retained.push(id);
+            continue;
+        }
+        match lookups.get(&id) {
+            Some(DocLookup::Absent) => {
+                store.release(&id).map_err(ReconcileError::Store)?;
+                dropped.push(id);
+            }
+            Some(DocLookup::Present(view)) => {
+                match mapping.classify(&view.doc_type, &view.status) {
+                    Some(StateRole::Terminal) => {
+                        store.release(&id).map_err(ReconcileError::Store)?;
+                        finalized.push(id);
+                    }
+                    // Active, dispatch, or unmapped: the work is not done, so the
+                    // claim stays put.
+                    _ => retained.push(id),
+                }
+            }
+            None => retained.push(id),
         }
     }
 
     Ok(ReconcileReport {
         released,
+        dropped,
+        finalized,
         retained,
         re_offered,
     })
@@ -423,6 +473,7 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::process::Command;
     use std::sync::{Arc, Mutex};
 
@@ -437,13 +488,17 @@ mod tests {
 
     /// A tracker fake: offers a fixed candidate listing, answers `fetch_doc` with
     /// a canned parent, records every advance, and can flip a candidate to an
-    /// active state once claimed (so a re-fetch drops it, as lazyspec would).
+    /// active state once claimed (so a re-fetch drops it, as lazyspec would). For
+    /// reconcile, `lookups` supplies each claim's lazyspec state and `lookup_fails`
+    /// simulates lazyspec being unreadable.
     struct FakeTracker {
         candidate: Mutex<Option<Candidate>>,
         parent: DocView,
         advances: Arc<Mutex<Vec<(String, String)>>>,
         drop_after_claim: bool,
         fail_advance: bool,
+        lookups: HashMap<String, DocLookup>,
+        lookup_fails: bool,
     }
 
     impl FakeTracker {
@@ -454,6 +509,8 @@ mod tests {
                 advances: Arc::new(Mutex::new(Vec::new())),
                 drop_after_claim: false,
                 fail_advance: false,
+                lookups: HashMap::new(),
+                lookup_fails: false,
             }
         }
 
@@ -469,6 +526,26 @@ mod tests {
 
         fn fetch_doc(&self, _id: &str) -> Result<DocView, TrackerError> {
             Ok(self.parent.clone())
+        }
+
+        fn lookup_doc(&self, id: &str) -> Result<DocLookup, TrackerError> {
+            if self.lookup_fails {
+                return Err(TrackerError::Command {
+                    code: Some(1),
+                    stderr: "lazyspec unreadable".to_string(),
+                });
+            }
+            // Default an unlisted id to a live active iteration so live-lease
+            // tests that don't care about lazyspec keep retaining.
+            Ok(self.lookups.get(id).cloned().unwrap_or_else(|| {
+                DocLookup::Present(DocView {
+                    id: id.to_string(),
+                    doc_type: "iteration".to_string(),
+                    title: String::new(),
+                    body: String::new(),
+                    status: "in-progress".to_string(),
+                })
+            }))
         }
 
         fn advance(&self, id: &str, target: &str) -> Result<(), TrackerError> {
@@ -571,6 +648,7 @@ mod tests {
             doc_type: "story".to_string(),
             title: "Execute one iteration end-to-end".to_string(),
             body: "As an operator, I want one eligible iteration to flow through.".to_string(),
+            status: "in-progress".to_string(),
         }
     }
 
@@ -781,6 +859,8 @@ mod tests {
             advances: Arc::new(Mutex::new(Vec::new())),
             drop_after_claim: false,
             fail_advance: false,
+            lookups: HashMap::new(),
+            lookup_fails: false,
         };
         let adapter = FakeAdapter::new(completed_report());
 
@@ -829,10 +909,13 @@ mod tests {
             advances: Arc::new(Mutex::new(Vec::new())),
             drop_after_claim: false,
             fail_advance: false,
+            lookups: HashMap::new(),
+            lookup_fails: false,
         };
 
         let after_expiry = NOW + DEFAULT_LEASE_TTL.as_millis() as u64 + 1;
-        let report = reconcile(&store, &tracker, after_expiry).unwrap();
+        let report =
+            reconcile(&store, &tracker, &RoleMapping::adr003_default(), after_expiry).unwrap();
 
         assert_eq!(report.released, vec!["ITER-014".to_string()]);
         assert!(
@@ -870,10 +953,13 @@ mod tests {
             advances: Arc::new(Mutex::new(Vec::new())),
             drop_after_claim: false,
             fail_advance: false,
+            lookups: HashMap::new(),
+            lookup_fails: false,
         };
 
         let after_expiry = NOW + DEFAULT_LEASE_TTL.as_millis() as u64 + 1;
-        let mut report = reconcile(&store, &tracker, after_expiry).unwrap();
+        let mut report =
+            reconcile(&store, &tracker, &RoleMapping::adr003_default(), after_expiry).unwrap();
         report.released.sort();
 
         assert_eq!(
@@ -895,11 +981,144 @@ mod tests {
             .unwrap();
         let tracker = FakeTracker::new(candidate(), parent());
 
-        let report = reconcile(&store, &tracker, NOW + 1).unwrap();
+        let report = reconcile(&store, &tracker, &RoleMapping::adr003_default(), NOW + 1).unwrap();
 
         assert_eq!(report.retained, vec!["ITER-014".to_string()]);
         assert!(report.released.is_empty());
         assert!(store.get("ITER-014").unwrap().is_some());
+    }
+
+    fn iteration_doc(id: &str, status: &str) -> DocLookup {
+        DocLookup::Present(DocView {
+            id: id.to_string(),
+            doc_type: "iteration".to_string(),
+            title: String::new(),
+            body: String::new(),
+            status: status.to_string(),
+        })
+    }
+
+    fn tracker_with_lookups(lookups: HashMap<String, DocLookup>) -> FakeTracker {
+        FakeTracker {
+            // Offer nothing: a released id must never also be dispatch-eligible.
+            candidate: Mutex::new(None),
+            parent: parent(),
+            advances: Arc::new(Mutex::new(Vec::new())),
+            drop_after_claim: false,
+            fail_advance: false,
+            lookups,
+            lookup_fails: false,
+        }
+    }
+
+    fn live_claim_store() -> (TempDir, Store) {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(&dir.path().join("store.redb")).unwrap();
+        store
+            .claim("ITER-014", HOLDER, NOW, DEFAULT_LEASE_TTL)
+            .unwrap();
+        (dir, store)
+    }
+
+    // STORY-017 AC1: a live-lease claim whose document lazyspec no longer has is
+    // dropped and recorded.
+    #[test]
+    fn reconcile_drops_a_claim_whose_doc_is_absent() {
+        let (_dir, store) = live_claim_store();
+        let tracker = tracker_with_lookups(HashMap::from([(
+            "ITER-014".to_string(),
+            DocLookup::Absent,
+        )]));
+
+        let report = reconcile(&store, &tracker, &RoleMapping::adr003_default(), NOW + 1).unwrap();
+
+        assert_eq!(report.dropped, vec!["ITER-014".to_string()]);
+        assert!(report.retained.is_empty());
+        assert!(report.released.is_empty());
+        assert_eq!(store.get("ITER-014").unwrap(), None, "claim must be dropped");
+    }
+
+    // STORY-017 AC2: a live-lease claim lazyspec reports terminal-complete is
+    // finalized (released) and never re-offered.
+    #[test]
+    fn reconcile_finalizes_a_terminal_complete_claim_without_re_offer() {
+        let (_dir, store) = live_claim_store();
+        let tracker = tracker_with_lookups(HashMap::from([(
+            "ITER-014".to_string(),
+            iteration_doc("ITER-014", "complete"),
+        )]));
+
+        let report = reconcile(&store, &tracker, &RoleMapping::adr003_default(), NOW + 1).unwrap();
+
+        assert_eq!(report.finalized, vec!["ITER-014".to_string()]);
+        assert!(report.re_offered.is_empty(), "{report:?}");
+        assert!(report.retained.is_empty());
+        assert_eq!(
+            store.get("ITER-014").unwrap(),
+            None,
+            "a completed item's claim must be released"
+        );
+        assert!(
+            tracker.fetch_dispatchable().unwrap().is_empty(),
+            "a completed item must not be dispatched again"
+        );
+    }
+
+    // STORY-017 AC3: a live-lease claim lazyspec still reports active is retained.
+    #[test]
+    fn reconcile_retains_a_claim_whose_doc_is_active() {
+        let (_dir, store) = live_claim_store();
+        let tracker = tracker_with_lookups(HashMap::from([(
+            "ITER-014".to_string(),
+            iteration_doc("ITER-014", "in-progress"),
+        )]));
+
+        let report = reconcile(&store, &tracker, &RoleMapping::adr003_default(), NOW + 1).unwrap();
+
+        assert_eq!(report.retained, vec!["ITER-014".to_string()]);
+        assert!(report.dropped.is_empty());
+        assert!(report.finalized.is_empty());
+        assert!(store.get("ITER-014").unwrap().is_some());
+    }
+
+    // STORY-017 AC4: when lazyspec cannot be read, reconcile mutates nothing —
+    // not even an expired orphan — and returns so the next cycle retries.
+    #[test]
+    fn reconcile_read_failure_retains_every_claim_and_returns() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(&dir.path().join("store.redb")).unwrap();
+        // A live lease (forces a lazyspec lookup) and an expired orphan that
+        // would otherwise be released.
+        store
+            .claim("ITER-014", HOLDER, NOW, DEFAULT_LEASE_TTL)
+            .unwrap();
+        store
+            .claim("ITER-900", HOLDER, NOW - 10, Duration::from_millis(1))
+            .unwrap();
+        let tracker = FakeTracker {
+            candidate: Mutex::new(None),
+            parent: parent(),
+            advances: Arc::new(Mutex::new(Vec::new())),
+            drop_after_claim: false,
+            fail_advance: false,
+            lookups: HashMap::new(),
+            lookup_fails: true,
+        };
+
+        let result = reconcile(&store, &tracker, &RoleMapping::adr003_default(), NOW + 1);
+
+        assert!(
+            matches!(result, Err(ReconcileError::Tracker(_))),
+            "a read failure must surface as an error to retry: {result:?}"
+        );
+        assert!(
+            store.get("ITER-014").unwrap().is_some(),
+            "the live lease must be untouched"
+        );
+        assert!(
+            store.get("ITER-900").unwrap().is_some(),
+            "even the expired orphan must be untouched on a read failure"
+        );
     }
 
     // A lost claim (already held) is reported as skipped, not run.
@@ -956,6 +1175,8 @@ mod tests {
             advances: Arc::new(Mutex::new(Vec::new())),
             drop_after_claim: false,
             fail_advance: true,
+            lookups: HashMap::new(),
+            lookup_fails: false,
         };
         let adapter = FakeAdapter::new(completed_report());
 

@@ -97,7 +97,7 @@ impl std::error::Error for PromptError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tracker::CliFailure;
+    use crate::tracker::{CliFailure, DocLookup};
 
     struct FakeTracker {
         parent: Result<DocView, ()>,
@@ -127,6 +127,10 @@ mod tests {
             })
         }
 
+        fn lookup_doc(&self, _id: &str) -> Result<DocLookup, TrackerError> {
+            unimplemented!("not exercised by prompt tests")
+        }
+
         fn advance(&self, _id: &str, _target_state: &str) -> Result<(), TrackerError> {
             unimplemented!("not exercised by prompt tests")
         }
@@ -150,6 +154,7 @@ mod tests {
             doc_type: "story".to_string(),
             title: "Assemble prompt from iteration plus parent context".to_string(),
             body: "As an operator, I want the plan with its parent intent.".to_string(),
+            status: "accepted".to_string(),
         }
     }
 

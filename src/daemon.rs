@@ -245,10 +245,18 @@ where
         let projection = Projection::new(log_path);
         let snapshot = Snapshot::new(store_dir);
         let now = now_ms();
-        if let Ok(report) = reconcile(&store, &tracker, now) {
+        let mapping = RoleMapping::from_config(&config);
+        if let Ok(report) = reconcile(&store, &tracker, &mapping, now) {
             // A daemon restart, not a new commit: there is no live holder to
-            // attribute the release to, so the line carries only the id.
-            for id in &report.released {
+            // attribute the release to, so the line carries only the id. Expired
+            // orphans, vanished-doc drops, and completed finalizations are all
+            // durable claim releases, so each is projected the same way.
+            for id in report
+                .released
+                .iter()
+                .chain(&report.dropped)
+                .chain(&report.finalized)
+            {
                 projection.record(now, id, EventKind::ReconcileRelease, &[]);
                 snapshot.remove_ref(id);
             }
@@ -527,7 +535,7 @@ mod tests {
     use crate::agent::AgentEvent;
     use crate::config::load_str;
     use crate::mapping::StubDag;
-    use crate::tracker::{DocView, TrackerError};
+    use crate::tracker::{DocLookup, DocView, TrackerError};
     use crate::workspace::Worktree;
 
     /// A tracker fake offering one candidate, a canned parent for prompt
@@ -544,6 +552,10 @@ mod tests {
 
         fn fetch_doc(&self, _id: &str) -> Result<DocView, TrackerError> {
             Ok(self.parent.clone())
+        }
+
+        fn lookup_doc(&self, _id: &str) -> Result<DocLookup, TrackerError> {
+            Ok(DocLookup::Present(self.parent.clone()))
         }
 
         fn advance(&self, _id: &str, _target: &str) -> Result<(), TrackerError> {
@@ -627,6 +639,7 @@ mod tests {
                 doc_type: "story".to_string(),
                 title: "Execute one iteration end-to-end".to_string(),
                 body: "As an operator, I want one eligible iteration to flow.".to_string(),
+                status: "in-progress".to_string(),
             },
         }
     }
