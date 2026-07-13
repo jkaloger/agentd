@@ -568,12 +568,7 @@ mod tests {
 
     fn blocking_adapter() -> (BlockingAdapter, Arc<Notify>) {
         let gate = Arc::new(Notify::new());
-        (
-            BlockingAdapter {
-                gate: gate.clone(),
-            },
-            gate,
-        )
+        (BlockingAdapter { gate: gate.clone() }, gate)
     }
 
     /// The sandbox denies `AF_UNIX` bind (Operation not permitted). Socket
