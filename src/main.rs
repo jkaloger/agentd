@@ -1,6 +1,8 @@
 use clap::{Parser, Subcommand};
 
 #[allow(dead_code)]
+mod adapter;
+#[allow(dead_code)]
 mod agent;
 mod config;
 mod daemon;

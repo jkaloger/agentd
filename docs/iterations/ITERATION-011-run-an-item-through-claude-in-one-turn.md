@@ -1,7 +1,7 @@
 ---
 title: Run an item through Claude in one turn
 type: iteration
-status: draft
+status: complete
 author: Jack Kaloger
 date: 2026-07-13
 tags: []
