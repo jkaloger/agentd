@@ -1,7 +1,7 @@
 ---
 title: Poll the backlog on a cadence
 type: story
-status: draft
+status: review
 author: Jack Kaloger
 date: 2026-07-13
 tags: []

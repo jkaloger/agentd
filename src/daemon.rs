@@ -2,7 +2,7 @@ use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -205,12 +205,20 @@ where
 struct Orchestrator {
     state: SharedState,
     shutdown_tx: watch::Sender<bool>,
+    /// Seeds the worker's reloadable config source. The producer that pushes
+    /// fresh config through this handle is STORY-050; until then it is dormant
+    /// in production and only exercised by tests.
+    #[allow(dead_code)]
+    config_tx: watch::Sender<Config>,
     worker_handles: Vec<JoinHandle<()>>,
 }
 
-/// Reconcile the store, then run one tick, publishing the claimed item as Running
-/// the moment it is activated and replacing it with a terminal record when the
-/// turn resolves. No socket is bound here.
+/// Reconcile the store once, then poll: run a tick, wait `poll_interval_ms`, and
+/// tick again, until shutdown. Each tick publishes the claimed item as Running the
+/// moment it is activated and replaces it with a terminal record when the turn
+/// resolves. Ticks are sequential — the next wait starts only when the current
+/// tick's post-commit seam completes, so no two ticks overlap. No socket is bound
+/// here.
 fn spawn_orchestrator<T, A>(
     config_path: &Path,
     config: Config,
@@ -237,6 +245,8 @@ where
     let log_path = store_dir.join("log");
     let template = read_template(&repo, &config);
     let worker_state = state.clone();
+    let (config_tx, config_rx) = watch::channel(config);
+    let mut shutdown_rx = shutdown_tx.subscribe();
 
     let worker_handles = vec![tokio::spawn(async move {
         let store = match Store::open(&store_path) {
@@ -245,113 +255,132 @@ where
         };
         let projection = Projection::new(log_path);
         let snapshot = Snapshot::new(store_dir);
-        let now = now_ms();
-        let mapping = RoleMapping::from_config(&config);
-        let worktrees = DiskWorktrees::new(repo.join(&config.workspace.root));
-        if let Ok(report) = reconcile(&store, &tracker, &worktrees, &mapping, now) {
-            // A daemon restart, not a new commit: there is no live holder to
-            // attribute the release to, so the line carries only the id. Expired
-            // orphans, vanished-doc drops, completed finalizations, and claims
-            // whose worktree vanished are all durable claim releases, so each is
-            // projected the same way.
-            for id in report
-                .released
-                .iter()
-                .chain(&report.dropped)
-                .chain(&report.finalized)
-                .chain(&report.abandoned)
-            {
-                projection.record(now, id, EventKind::ReconcileRelease, &[]);
-                snapshot.remove_ref(id);
-            }
-            if let Ok(claims) = store.claims() {
-                snapshot.write_state(&claims);
-            }
-        }
 
-        let running_state = worker_state.clone();
-        let on_activated = move |candidate: &Candidate| {
-            running_state.lock().unwrap().running.push(RunningItem {
-                id: candidate.id.clone(),
-                identifier: candidate.identifier.clone(),
-                started_at_ms: now_ms(),
-            });
-        };
-
-        let report = run_tick(
-            &tracker,
-            &store,
-            &adapter,
-            &config,
-            &template,
-            &repo,
-            now,
-            HOLDER,
-            on_activated,
-        )
-        .await;
-
-        match report {
-            TickReport::Dispatched(record) => {
-                // Post-commit seam (ADR-002): the store transaction already
-                // committed inside `run_tick`/`claim_and_activate`; this only
-                // best-effort mirrors that outcome to the plain-text log.
-                projection.record(
-                    record.claimed_at_ms,
-                    &record.id,
-                    EventKind::Claim,
-                    &[("holder", &record.holder)],
-                );
-                if record.claim_released {
-                    projection.record(
-                        record.ended_at_ms,
-                        &record.id,
-                        EventKind::Release,
-                        &[("holder", &record.holder)],
-                    );
-                    snapshot.remove_ref(&record.id);
-                } else if let Ok(Some(held)) = store.get(&record.id) {
-                    snapshot.set_ref(&record.id, &held.holder, held.fence);
+        {
+            let config = config_rx.borrow().clone();
+            let now = now_ms();
+            let mapping = RoleMapping::from_config(&config);
+            let worktrees = DiskWorktrees::new(repo.join(&config.workspace.root));
+            if let Ok(report) = reconcile(&store, &tracker, &worktrees, &mapping, now) {
+                // A daemon restart, not a new commit: there is no live holder to
+                // attribute the release to, so the line carries only the id. Expired
+                // orphans, vanished-doc drops, completed finalizations, and claims
+                // whose worktree vanished are all durable claim releases, so each is
+                // projected the same way.
+                for id in report
+                    .released
+                    .iter()
+                    .chain(&report.dropped)
+                    .chain(&report.finalized)
+                    .chain(&report.abandoned)
+                {
+                    projection.record(now, id, EventKind::ReconcileRelease, &[]);
+                    snapshot.remove_ref(id);
                 }
                 if let Ok(claims) = store.claims() {
                     snapshot.write_state(&claims);
                 }
-
-                let mut state = worker_state.lock().unwrap();
-                state.running.retain(|item| item.id != record.id);
-                state.records.push(*record);
             }
-            // Same post-commit seam as above (STORY-019 AC1): a gated-out advance
-            // still durably claims-then-releases before the tick reports Skipped,
-            // so those commits must reach the log and snapshot too. A lost claim
-            // never touched the store, so it projects nothing.
-            TickReport::Skipped { id, claim, .. } => match claim {
-                SkipClaim::ClaimedThenReleased => {
-                    projection.record(now, &id, EventKind::Claim, &[("holder", HOLDER)]);
-                    projection.record(now, &id, EventKind::Release, &[("holder", HOLDER)]);
-                    snapshot.remove_ref(&id);
+        }
+
+        loop {
+            let now = now_ms();
+            let config = config_rx.borrow().clone();
+
+            let running_state = worker_state.clone();
+            let on_activated = move |candidate: &Candidate| {
+                running_state.lock().unwrap().running.push(RunningItem {
+                    id: candidate.id.clone(),
+                    identifier: candidate.identifier.clone(),
+                    started_at_ms: now_ms(),
+                });
+            };
+
+            let report = run_tick(
+                &tracker,
+                &store,
+                &adapter,
+                &config,
+                &template,
+                &repo,
+                now,
+                HOLDER,
+                on_activated,
+            )
+            .await;
+
+            match report {
+                TickReport::Dispatched(record) => {
+                    // Post-commit seam (ADR-002): the store transaction already
+                    // committed inside `run_tick`/`claim_and_activate`; this only
+                    // best-effort mirrors that outcome to the plain-text log.
+                    projection.record(
+                        record.claimed_at_ms,
+                        &record.id,
+                        EventKind::Claim,
+                        &[("holder", &record.holder)],
+                    );
+                    if record.claim_released {
+                        projection.record(
+                            record.ended_at_ms,
+                            &record.id,
+                            EventKind::Release,
+                            &[("holder", &record.holder)],
+                        );
+                        snapshot.remove_ref(&record.id);
+                    } else if let Ok(Some(held)) = store.get(&record.id) {
+                        snapshot.set_ref(&record.id, &held.holder, held.fence);
+                    }
                     if let Ok(claims) = store.claims() {
                         snapshot.write_state(&claims);
                     }
+
+                    let mut state = worker_state.lock().unwrap();
+                    state.running.retain(|item| item.id != record.id);
+                    state.records.push(*record);
                 }
-                SkipClaim::ClaimedReleaseFailed => {
-                    projection.record(now, &id, EventKind::Claim, &[("holder", HOLDER)]);
-                    if let Ok(Some(held)) = store.get(&id) {
-                        snapshot.set_ref(&id, &held.holder, held.fence);
+                // Same post-commit seam as above (STORY-019 AC1): a gated-out advance
+                // still durably claims-then-releases before the tick reports Skipped,
+                // so those commits must reach the log and snapshot too. A lost claim
+                // never touched the store, so it projects nothing.
+                TickReport::Skipped { id, claim, .. } => match claim {
+                    SkipClaim::ClaimedThenReleased => {
+                        projection.record(now, &id, EventKind::Claim, &[("holder", HOLDER)]);
+                        projection.record(now, &id, EventKind::Release, &[("holder", HOLDER)]);
+                        snapshot.remove_ref(&id);
+                        if let Ok(claims) = store.claims() {
+                            snapshot.write_state(&claims);
+                        }
                     }
-                    if let Ok(claims) = store.claims() {
-                        snapshot.write_state(&claims);
+                    SkipClaim::ClaimedReleaseFailed => {
+                        projection.record(now, &id, EventKind::Claim, &[("holder", HOLDER)]);
+                        if let Ok(Some(held)) = store.get(&id) {
+                            snapshot.set_ref(&id, &held.holder, held.fence);
+                        }
+                        if let Ok(claims) = store.claims() {
+                            snapshot.write_state(&claims);
+                        }
                     }
-                }
-                SkipClaim::NotClaimed => {}
-            },
-            TickReport::Idle | TickReport::Error(_) => {}
+                    SkipClaim::NotClaimed => {}
+                },
+                TickReport::Idle | TickReport::Error(_) => {}
+            }
+
+            // Re-read the interval fresh so a reload governs the next wait only,
+            // never an in-flight tick (ADR-006/ADR-007). The sleep races the
+            // shutdown watch so the loop exits promptly instead of after a full wait.
+            let interval = config_rx.borrow().poll_interval_ms;
+            tokio::select! {
+                _ = wait_true(&mut shutdown_rx) => break,
+                _ = tokio::time::sleep(Duration::from_millis(interval)) => {}
+            }
         }
     })];
 
     Orchestrator {
         state,
         shutdown_tx,
+        config_tx,
         worker_handles,
     }
 }
@@ -530,6 +559,7 @@ mod tests {
     use std::os::unix::net::UnixListener as StdUnixListener;
     use std::process::Command;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use tempfile::TempDir;
@@ -547,10 +577,12 @@ mod tests {
     struct FakeTracker {
         candidate: Candidate,
         parent: DocView,
+        fetches: Arc<AtomicUsize>,
     }
 
     impl Tracker for FakeTracker {
         fn fetch_dispatchable(&self) -> Result<Vec<Candidate>, TrackerError> {
+            self.fetches.fetch_add(1, Ordering::SeqCst);
             Ok(vec![self.candidate.clone()])
         }
 
@@ -627,8 +659,18 @@ mod tests {
         path
     }
 
+    /// A `FakeTracker` plus a handle to its fetch counter. `fetch_dispatchable`
+    /// is called once by reconcile at startup and once per tick, so the count is
+    /// a faithful per-tick signal (STORY-002 AC1/AC3).
+    fn fake_tracker_counting() -> (FakeTracker, Arc<AtomicUsize>) {
+        let tracker = fake_tracker();
+        let fetches = tracker.fetches.clone();
+        (tracker, fetches)
+    }
+
     fn fake_tracker() -> FakeTracker {
         FakeTracker {
+            fetches: Arc::new(AtomicUsize::new(0)),
             candidate: Candidate {
                 id: "ITER-014".to_string(),
                 identifier: "execute-one-iteration".to_string(),
@@ -679,6 +721,123 @@ mod tests {
         panic!("no status item appeared");
     }
 
+    async fn wait_for_running(state: &SharedState) {
+        for _ in 0..400 {
+            if !state.lock().unwrap().running.is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("no running item appeared");
+    }
+
+    async fn wait_for_records(state: &SharedState, n: usize) {
+        for _ in 0..400 {
+            if state.lock().unwrap().records.len() >= n {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("fewer than {n} records accumulated");
+    }
+
+    async fn wait_for_fetches(fetches: &Arc<AtomicUsize>, n: usize) {
+        for _ in 0..400 {
+            if fetches.load(Ordering::SeqCst) >= n {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("fewer than {n} tick fetches");
+    }
+
+    async fn drain_and_shutdown(orch: Orchestrator, gate: &Arc<Notify>) {
+        let _ = orch.shutdown_tx.send(true);
+        gate.notify_one();
+        for handle in orch.worker_handles {
+            handle.await.unwrap();
+        }
+    }
+
+    // STORY-002 AC1: once the first tick completes, the loop waits the interval
+    // and ticks again. A completed run keeps its claim, so a re-offered candidate
+    // is skipped rather than re-dispatched — the faithful "another tick ran"
+    // signal is a further fetch_dispatchable call, not a second record.
+    #[tokio::test]
+    async fn a_second_tick_runs_after_the_first_completes() {
+        let (_repo, config_path, _socket) = init_project("");
+        let (adapter, gate) = blocking_adapter();
+        let (tracker, fetches) = fake_tracker_counting();
+        let mut config = load_str("").unwrap();
+        config.poll_interval_ms = 5;
+        let orch = spawn_orchestrator(&config_path, config, tracker, adapter);
+
+        wait_for_running(&orch.state).await;
+        let after_first_tick = fetches.load(Ordering::SeqCst);
+        gate.notify_one();
+        wait_for_records(&orch.state, 1).await;
+
+        wait_for_fetches(&fetches, after_first_tick + 1).await;
+
+        drain_and_shutdown(orch, &gate).await;
+    }
+
+    // STORY-002 AC2: ticks never overlap. The turn stays gated shut while the
+    // short interval elapses many times over, yet exactly one turn is ever in
+    // flight and nothing completes — a concurrent model would have started more.
+    #[tokio::test]
+    async fn ticks_do_not_overlap_while_one_is_in_flight() {
+        let (_repo, config_path, _socket) = init_project("");
+        let (adapter, gate) = blocking_adapter();
+        let mut config = load_str("").unwrap();
+        config.poll_interval_ms = 5;
+        let orch = spawn_orchestrator(&config_path, config, fake_tracker(), adapter);
+
+        wait_for_running(&orch.state).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        {
+            let state = orch.state.lock().unwrap();
+            assert_eq!(
+                state.running.len(),
+                1,
+                "one turn in flight; the next tick must not start until it completes"
+            );
+            assert!(
+                state.records.is_empty(),
+                "no tick may complete while the first is still blocked"
+            );
+        }
+
+        drain_and_shutdown(orch, &gate).await;
+    }
+
+    // STORY-002 AC3: the interval is re-read each cycle. Starting from a 10-minute
+    // interval, updating the shared config while the first tick is in flight makes
+    // the next wait 5ms, so the following tick fetches well inside the test budget
+    // — impossible if the stale 10-minute value still governed the wait.
+    #[tokio::test]
+    async fn a_reloaded_interval_governs_the_next_wait() {
+        let (_repo, config_path, _socket) = init_project("");
+        let (adapter, gate) = blocking_adapter();
+        let (tracker, fetches) = fake_tracker_counting();
+        let mut slow = load_str("").unwrap();
+        slow.poll_interval_ms = 600_000;
+        let orch = spawn_orchestrator(&config_path, slow, tracker, adapter);
+
+        wait_for_running(&orch.state).await;
+        let after_first_tick = fetches.load(Ordering::SeqCst);
+
+        let mut fast = load_str("").unwrap();
+        fast.poll_interval_ms = 5;
+        orch.config_tx.send(fast).unwrap();
+
+        gate.notify_one();
+        wait_for_records(&orch.state, 1).await;
+        wait_for_fetches(&fetches, after_first_tick + 1).await;
+
+        drain_and_shutdown(orch, &gate).await;
+    }
+
     // The dispatch path — claim, publish Running, run the turn — without binding a
     // control socket, so it is exercised even where the sandbox blocks bind.
     #[tokio::test]
@@ -700,6 +859,8 @@ mod tests {
         assert_eq!(running.identifier, "execute-one-iteration");
         assert!(running.started_at_ms > 0);
 
+        // The poll loop never exits on its own; shut it down after this one tick.
+        let _ = orch.shutdown_tx.send(true);
         gate.notify_one();
         for handle in orch.worker_handles {
             handle.await.unwrap();
@@ -735,6 +896,8 @@ mod tests {
         let (adapter, gate) = blocking_adapter();
         let orch =
             spawn_orchestrator(&config_path, load_str("").unwrap(), fake_tracker(), adapter);
+        // Reconcile is the one-time prelude; end the loop after it and the first tick.
+        let _ = orch.shutdown_tx.send(true);
         gate.notify_one();
         for handle in orch.worker_handles {
             handle.await.unwrap();
