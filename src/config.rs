@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 const DEFAULT_POLL_INTERVAL_MS: u64 = 5000;
+const DEFAULT_MAX_RETRY_BACKOFF_MS: u64 = 3_600_000;
 const DEFAULT_MAX_CONCURRENT: u32 = 2;
 const DEFAULT_MAX_TURNS: u32 = 1;
 const DEFAULT_AUTO_APPROVE: bool = true;
@@ -42,6 +43,9 @@ pub enum StateRole {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub poll_interval_ms: u64,
+    /// Upper bound on the exponential retry backoff (STORY-008, ADR-007): a
+    /// failed item's next attempt is due `min(10000 * 2^(attempt-1), this)` ms out.
+    pub max_retry_backoff_ms: u64,
     pub max_concurrent: u32,
     pub agent: Agent,
     pub workspace: Workspace,
@@ -139,6 +143,11 @@ fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
     let poll_interval_ms = raw.poll_interval_ms.unwrap_or(DEFAULT_POLL_INTERVAL_MS);
     require_positive("poll_interval_ms", poll_interval_ms)?;
 
+    let max_retry_backoff_ms = raw
+        .max_retry_backoff_ms
+        .unwrap_or(DEFAULT_MAX_RETRY_BACKOFF_MS);
+    require_positive("max_retry_backoff_ms", max_retry_backoff_ms)?;
+
     let max_concurrent = raw.max_concurrent.unwrap_or(DEFAULT_MAX_CONCURRENT);
     require_positive("max_concurrent", max_concurrent as u64)?;
 
@@ -208,6 +217,7 @@ fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
 
     Ok(Config {
         poll_interval_ms,
+        max_retry_backoff_ms,
         max_concurrent,
         agent,
         workspace,
@@ -261,6 +271,7 @@ pub(crate) fn default_states() -> BTreeMap<String, StateRole> {
 #[derive(Deserialize)]
 struct RawConfig {
     poll_interval_ms: Option<u64>,
+    max_retry_backoff_ms: Option<u64>,
     max_concurrent: Option<u32>,
     #[serde(default)]
     agent: RawAgent,
@@ -324,6 +335,7 @@ mod tests {
         let config = load_str("").unwrap();
 
         assert_eq!(config.poll_interval_ms, 5000);
+        assert_eq!(config.max_retry_backoff_ms, 3_600_000);
         assert_eq!(config.max_concurrent, 2);
         assert_eq!(config.agent.kind, AgentKind::Claude);
         assert_eq!(config.agent.max_turns, 1);
@@ -365,6 +377,19 @@ kind = "codex"
         let err = load_str("poll_interval_ms = 0").unwrap_err();
         assert!(matches!(err, ConfigError::Invalid { .. }));
         assert!(err.to_string().contains("poll_interval_ms"), "{err}");
+    }
+
+    #[test]
+    fn max_retry_backoff_override_is_honoured() {
+        let config = load_str("max_retry_backoff_ms = 60000").unwrap();
+        assert_eq!(config.max_retry_backoff_ms, 60000);
+    }
+
+    #[test]
+    fn out_of_range_max_retry_backoff_names_the_key() {
+        let err = load_str("max_retry_backoff_ms = 0").unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid { .. }));
+        assert!(err.to_string().contains("max_retry_backoff_ms"), "{err}");
     }
 
     #[test]

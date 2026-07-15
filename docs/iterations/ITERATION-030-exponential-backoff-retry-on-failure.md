@@ -1,7 +1,7 @@
 ---
 title: Exponential backoff retry on failure
 type: iteration
-status: review
+status: complete
 author: Jack Kaloger
 date: 2026-07-14
 tags: []
@@ -16,7 +16,7 @@ On an abnormal worker exit, schedule a retry with `due_at = now + min(10000 * 2^
 - Implements: STORY-008 (ACs there). Builds on STORY-007's clean-exit continuation path (running-entry removal + retry-scheduling seam).
 - Architecture: [[ADR-002]] durable state — the retry schedule is re-derived from `due_at`, never held as an in-memory timer; [[ADR-007]] scheduling policy.
 - Reuses (ITERATION-019 → STORY-018, complete): `src/store.rs` `Store::schedule_retry(id, attempt, error, due_at)` (durably replaces any prior entry for the id → this alone satisfies "cancel prior"), `RetryRecord { attempt, error, due_at }`.
-- Touch: `src/config.rs` `resolve`/`require_positive` (add `max_retry_backoff_ms`, does not exist); `src/tick.rs` worker-exit handler (abnormal exit = `TurnOutcome::Failed`/`claim_released` path) — add the backoff computation; `src/daemon.rs` `DaemonState`/`ItemView` — retry-queue view exposing attempt + error.
+- Touch: `src/config.rs` `resolve`/`require_positive` (add `max_retry_backoff_ms`, does not exist); `src/daemon.rs` completion routing — post-substrate ([[ITERATION-037]]) the abnormal-exit signal is the released-claim `RunRecord` (the failed arm, `clean == !release_claim` is false) in `handle_completion`, symmetric with STORY-007's clean-exit continuation added there; add the backoff computation on the failed arm. The attempt number is derived from the prior `RetryRecord` for the id (via the store), defaulting to 1 on the first failure; the error string is the run's failure detail. `src/daemon.rs` `DaemonState`/`ItemView` — retry-queue view exposing attempt + error for `status`.
 
 ## Satisfies
 STORY-008 AC1–AC3.

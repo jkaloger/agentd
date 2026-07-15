@@ -162,6 +162,17 @@ impl RunRecord {
             .map(|t| t.target_state.clone())
             .unwrap_or_else(|| "-".to_string())
     }
+
+    /// The failure detail behind a non-clean exit (STORY-008): the agent's
+    /// reported reason or launch error, falling back to the transition error when
+    /// the outcome itself resolved. Empty when there is no failure to report.
+    pub fn failure_detail(&self) -> &str {
+        match &self.outcome {
+            TurnOutcome::Failed { reason } => reason,
+            TurnOutcome::LaunchError { message } => message,
+            TurnOutcome::Completed => self.transition_error.as_deref().unwrap_or(""),
+        }
+    }
 }
 
 fn branch_label(branch: OutcomeBranch) -> &'static str {

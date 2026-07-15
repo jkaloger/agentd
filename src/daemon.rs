@@ -31,12 +31,41 @@ const HOLDER: &str = "agentd";
 /// re-checks the doc shortly after and re-dispatches it while it is still active.
 const CONTINUATION_RETRY_MS: u64 = 1000;
 
+/// The first retry's backoff (STORY-008): each further attempt doubles it, capped
+/// at `config.max_retry_backoff_ms`.
+const BASE_RETRY_BACKOFF_MS: u64 = 10_000;
+
 type SharedState = Arc<Mutex<DaemonState>>;
+
+/// Exponential backoff for the `attempt`-th failure (1-based, STORY-008 AC1):
+/// `10_000 * 2^(attempt-1)` ms, clamped to `max`. The shift-and-multiply is
+/// saturating — a large attempt clamps to `max` rather than overflowing.
+fn retry_backoff_ms(attempt: u32, max: u64) -> u64 {
+    let delay = 1u64
+        .checked_shl(attempt.saturating_sub(1))
+        .and_then(|factor| factor.checked_mul(BASE_RETRY_BACKOFF_MS))
+        .unwrap_or(u64::MAX);
+    delay.min(max)
+}
 
 #[derive(Default)]
 struct DaemonState {
     running: Vec<RunningItem>,
     records: Vec<RunRecord>,
+    /// Items with a pending backoff retry after a failed exit (STORY-008 AC3),
+    /// mirroring the durable retry schedule so `status` can render each with its
+    /// attempt and error. Keyed by id: a re-scheduled retry replaces its entry.
+    queued: Vec<QueuedRetry>,
+}
+
+/// A pending retry surfaced in `status` (STORY-008 AC3): which attempt it is and
+/// the error that scheduled it.
+struct QueuedRetry {
+    id: String,
+    identifier: String,
+    attempt: u32,
+    error: String,
+    started_at_ms: u64,
 }
 
 impl DaemonState {
@@ -87,6 +116,11 @@ pub struct ItemView {
     pub transition: String,
     pub runtime_ms: u64,
     pub started_at_ms: u64,
+    /// The retry attempt behind a queued item (STORY-008 AC3); `None` for a
+    /// running or terminal item.
+    pub attempt: Option<u32>,
+    /// The error that scheduled a queued retry (STORY-008 AC3); `None` otherwise.
+    pub error: Option<String>,
 }
 
 #[derive(Debug)]
@@ -400,7 +434,14 @@ where
             tokio::select! {
                 _ = wait_true(&mut shutdown_rx) => break,
                 Some(completion) = completion_rx.recv() => {
-                    handle_completion(completion, &store, &projection, &snapshot, &worker_state);
+                    handle_completion(
+                        completion,
+                        &store,
+                        &projection,
+                        &snapshot,
+                        &worker_state,
+                        config.max_retry_backoff_ms,
+                    );
                 }
                 _ = tokio::time::sleep(Duration::from_millis(interval)) => {}
             }
@@ -442,6 +483,7 @@ fn handle_completion(
     projection: &Projection,
     snapshot: &Snapshot,
     state: &SharedState,
+    max_retry_backoff_ms: u64,
 ) {
     // A clean turn does not finalize (ADR-004): `run_worker` retains the claim
     // (`release_claim` false) rather than releasing it. Read the flag before
@@ -475,12 +517,40 @@ fn handle_completion(
     // stays held and a durable attempt-1 retry is scheduled ~1s out. The fire
     // handler (ITERATION-031) consumes it to re-dispatch while the doc is active
     // or release otherwise; nothing here reads, releases, or re-dispatches.
+    //
+    // A failed exit released its claim; schedule an exponential backoff retry
+    // (STORY-008 AC1/AC2). The attempt is the prior schedule's + 1, else the first
+    // failure is attempt 1; `schedule_retry` replaces any prior entry for the id,
+    // so exactly one durable schedule remains. These branches are mutually
+    // exclusive: a clean exit never schedules a backoff, a failed one never a
+    // continuation.
+    let mut retry = None;
     if clean {
         let _ = store.schedule_retry(&record.id, 1, "", now_ms() + CONTINUATION_RETRY_MS);
+    } else {
+        let attempt = store
+            .retries()
+            .ok()
+            .and_then(|entries| entries.into_iter().find(|(id, _)| *id == record.id))
+            .map_or(1, |(_, prior)| prior.attempt + 1);
+        let error = record.failure_detail().to_string();
+        let due_at = now_ms() + retry_backoff_ms(attempt, max_retry_backoff_ms);
+        let _ = store.schedule_retry(&record.id, attempt, &error, due_at);
+        retry = Some((attempt, error));
     }
 
     let mut state = state.lock().unwrap();
     state.running.retain(|item| item.id != record.id);
+    if let Some((attempt, error)) = retry {
+        state.queued.retain(|q| q.id != record.id);
+        state.queued.push(QueuedRetry {
+            id: record.id.clone(),
+            identifier: record.identifier.clone(),
+            attempt,
+            error,
+            started_at_ms: record.started_at_ms,
+        });
+    }
     state.records.push(record);
 }
 
@@ -609,6 +679,7 @@ async fn handle_conn(stream: UnixStream, state: SharedState, shutdown_tx: watch:
                 .running
                 .iter()
                 .map(running_view)
+                .chain(state.queued.iter().map(queued_view))
                 .chain(state.records.iter().map(view))
                 .collect();
             Response::Status { items }
@@ -678,6 +749,8 @@ fn running_view(item: &RunningItem) -> ItemView {
         transition: "-".to_string(),
         runtime_ms: 0,
         started_at_ms: item.started_at_ms,
+        attempt: None,
+        error: None,
     }
 }
 
@@ -689,6 +762,21 @@ fn view(record: &RunRecord) -> ItemView {
         transition: record.transition_target(),
         runtime_ms: record.runtime_ms(),
         started_at_ms: record.started_at_ms,
+        attempt: None,
+        error: None,
+    }
+}
+
+fn queued_view(item: &QueuedRetry) -> ItemView {
+    ItemView {
+        id: item.id.clone(),
+        identifier: item.identifier.clone(),
+        state: "Queued".to_string(),
+        transition: "-".to_string(),
+        runtime_ms: 0,
+        started_at_ms: item.started_at_ms,
+        attempt: Some(item.attempt),
+        error: Some(item.error.clone()),
     }
 }
 
@@ -1200,10 +1288,11 @@ mod tests {
         );
     }
 
-    // STORY-007 AC1 (contrast): a failed exit still finalizes as before — the claim
-    // is released and no continuation retry is scheduled.
+    // STORY-008 AC1/AC2 (integration): a failed exit releases the claim and
+    // schedules a durable backoff retry — not a continuation — carrying the run's
+    // failure detail, with exactly one entry for the id (replace semantics).
     #[tokio::test]
-    async fn a_failed_exit_releases_the_claim_and_schedules_no_continuation() {
+    async fn a_failed_exit_releases_the_claim_and_schedules_a_backoff_retry() {
         let (_repo, config_path, _socket) = init_project("");
         let store_dir = config_path.parent().unwrap().to_path_buf();
         let (adapter, gate) = failing_blocking_adapter();
@@ -1230,16 +1319,147 @@ mod tests {
 
         drain_all(orch, &gate).await;
 
-        // A failed exit is a finalize, not a continuation: no retry is scheduled
-        // for it (a re-dispatched worker stays gated and is aborted on shutdown).
+        // A failed exit schedules a backoff retry carrying the failure detail, with
+        // exactly one durable entry for the id (a re-dispatch would only replace it).
         let store = Store::open(&store_dir.join("store.redb")).unwrap();
+        let entries: Vec<_> = store
+            .retries()
+            .unwrap()
+            .into_iter()
+            .filter(|(id, _)| id == "ITER-001")
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "a failed exit leaves exactly one durable retry for the id"
+        );
+        assert!(entries[0].1.attempt >= 1);
         assert!(
-            store
-                .retries()
-                .unwrap()
-                .iter()
-                .all(|(id, _)| id != "ITER-001"),
-            "a failed exit must not schedule a continuation retry"
+            !entries[0].1.error.is_empty(),
+            "the retry carries the run's failure detail"
+        );
+        assert!(entries[0].1.due_at > 0);
+    }
+
+    // STORY-008 AC1 + Verification: backoff doubles per attempt and a large attempt
+    // clamps to the max without overflowing.
+    #[test]
+    fn backoff_grows_exponentially_and_clamps_to_the_max() {
+        let max = 3_600_000;
+        assert_eq!(retry_backoff_ms(1, max), 10_000);
+        assert_eq!(retry_backoff_ms(2, max), 20_000);
+        assert_eq!(retry_backoff_ms(3, max), 40_000);
+        assert_eq!(retry_backoff_ms(4, max), 80_000);
+        // The unclamped 10_000 * 2^(attempt-1) overflows u64 well before these
+        // attempts, yet the saturating shift clamps to the max rather than panics.
+        assert_eq!(retry_backoff_ms(64, max), max);
+        assert_eq!(retry_backoff_ms(1000, max), max);
+        assert_eq!(retry_backoff_ms(u32::MAX, max), max);
+    }
+
+    /// A failed `WorkerCompletion` for `id` whose turn reported `reason`, with its
+    /// claim released — the released-claim path `handle_completion` schedules a
+    /// backoff retry for.
+    fn failed_completion(id: &str, reason: &str) -> WorkerCompletion {
+        WorkerCompletion {
+            record: RunRecord {
+                id: id.to_string(),
+                identifier: format!("iter-{id}"),
+                title: "t".to_string(),
+                holder: HOLDER.to_string(),
+                claimed_at_ms: 1000,
+                worktree: None,
+                branch: None,
+                started_at_ms: 2000,
+                ended_at_ms: 3000,
+                events: Vec::new(),
+                outcome: TurnOutcome::Failed {
+                    reason: reason.to_string(),
+                },
+                transition: None,
+                transition_error: None,
+                claim_released: false,
+            },
+            release_claim: true,
+        }
+    }
+
+    // STORY-008 AC1/AC2/AC3 (deterministic): handling a failed completion schedules
+    // a backoff retry with the failure detail and surfaces it in status; a second
+    // failure bumps the attempt (doubling the backoff) and replaces the entry, so
+    // exactly one durable schedule and one queued view remain.
+    #[test]
+    fn a_failed_completion_schedules_a_backoff_retry_replaces_it_and_surfaces_it() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(&dir.path().join("store.redb")).unwrap();
+        let projection = Projection::new(dir.path().join("log"));
+        let snapshot = Snapshot::new(dir.path().to_path_buf());
+        let state: SharedState = Arc::new(Mutex::new(DaemonState::default()));
+        let max = 3_600_000;
+
+        let before = now_ms();
+        handle_completion(
+            failed_completion("ITER-001", "boom"),
+            &store,
+            &projection,
+            &snapshot,
+            &state,
+            max,
+        );
+
+        // AC1: first failure is attempt 1, due ~10s out, carrying the error.
+        let first: Vec<_> = store
+            .retries()
+            .unwrap()
+            .into_iter()
+            .filter(|(id, _)| id == "ITER-001")
+            .collect();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].1.attempt, 1);
+        assert_eq!(first[0].1.error, "boom");
+        assert!(first[0].1.due_at >= before + BASE_RETRY_BACKOFF_MS);
+        assert!(first[0].1.due_at <= now_ms() + BASE_RETRY_BACKOFF_MS);
+
+        // AC3: status renders the queued item with its attempt and error.
+        let views: Vec<ItemView> = {
+            let state = state.lock().unwrap();
+            state.queued.iter().map(queued_view).collect()
+        };
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].id, "ITER-001");
+        assert_eq!(views[0].state, "Queued");
+        assert_eq!(views[0].attempt, Some(1));
+        assert_eq!(views[0].error.as_deref(), Some("boom"));
+
+        // AC1/AC2: a second failure bumps to attempt 2 (backoff doubled) and the
+        // replace semantics leave exactly one durable entry and one queued view.
+        let before = now_ms();
+        handle_completion(
+            failed_completion("ITER-001", "boom again"),
+            &store,
+            &projection,
+            &snapshot,
+            &state,
+            max,
+        );
+        let second: Vec<_> = store
+            .retries()
+            .unwrap()
+            .into_iter()
+            .filter(|(id, _)| id == "ITER-001")
+            .collect();
+        assert_eq!(
+            second.len(),
+            1,
+            "the prior schedule is replaced, not appended"
+        );
+        assert_eq!(second[0].1.attempt, 2);
+        assert_eq!(second[0].1.error, "boom again");
+        assert!(second[0].1.due_at >= before + 2 * BASE_RETRY_BACKOFF_MS);
+        assert_eq!(
+            state.lock().unwrap().queued.len(),
+            1,
+            "the queued view is replaced, not duplicated"
         );
     }
 
