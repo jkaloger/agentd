@@ -236,7 +236,7 @@ fn require_non_empty(key: &str, value: &str) -> Result<(), ConfigError> {
 
 fn resolve_caps(raw: BTreeMap<String, toml::Value>) -> BTreeMap<String, u32> {
     raw.into_iter()
-        .filter_map(|(key, value)| coerce_cap(&value).map(|cap| (key, cap)))
+        .filter_map(|(key, value)| coerce_cap(&value).map(|cap| (key.to_lowercase(), cap)))
         .collect()
 }
 
@@ -417,6 +417,22 @@ whatever = 1
         assert!(!config.per_status_caps.contains_key("review"));
         assert!(!config.per_status_caps.contains_key("broken"));
         assert_eq!(config.per_status_caps.len(), 1);
+    }
+
+    #[test]
+    fn per_status_cap_keys_are_lowercased() {
+        let config = load_str(
+            r#"
+[concurrency.per_status]
+"In-Progress" = 2
+"REVIEW" = 4
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.per_status_caps.get("in-progress"), Some(&2));
+        assert_eq!(config.per_status_caps.get("review"), Some(&4));
+        assert!(!config.per_status_caps.contains_key("In-Progress"));
     }
 
     #[test]

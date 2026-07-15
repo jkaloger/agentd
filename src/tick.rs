@@ -231,17 +231,27 @@ pub struct WorkerCompletion {
 /// `on_activated` fires exactly once, after the claim and advance-to-active both
 /// succeed and before any turn runs — the seam the daemon uses to publish the
 /// item as Running.
-pub fn dispatch_one<T, R>(
+///
+/// `at_status_cap` is the per-status concurrency gate (STORY-006, ADR-007): it is
+/// asked whether the active state a claimed worker would occupy
+/// (`config.transitions.claim`, lowercased) is already at its configured cap. A
+/// capped candidate is passed over exactly like a live-claimed one — not claimed,
+/// left for a future tick — so an uncapped status is never starved by a capped one.
+/// The daemon tallies its live-worker registry to answer; the inline path passes a
+/// predicate that never caps.
+pub fn dispatch_one<T, R, S>(
     tracker: &T,
     store: &Store,
     config: &Config,
     now: u64,
     holder: &str,
     on_activated: R,
+    at_status_cap: S,
 ) -> DispatchOutcome
 where
     T: Tracker,
     R: FnOnce(&Candidate),
+    S: Fn(&str) -> bool,
 {
     let mut candidates = match tracker.fetch_dispatchable() {
         Ok(candidates) => candidates,
@@ -253,10 +263,20 @@ where
     };
     candidates.sort_by(dispatch_order);
     let mapping = RoleMapping::from_config(config);
+    // The active state every claimed worker occupies (ADR-008): one target today
+    // (`config.transitions.claim`), so every candidate's prospective active state
+    // is the same. Lowercased to match the normalized per-status cap keys (AC3).
+    let active_state = config.transitions.claim.to_lowercase();
     let mut blocked = Vec::new();
     let mut selected = None;
     for candidate in candidates {
         if has_live_claim(store, &candidate.id, now) {
+            continue;
+        }
+        // Per-status cap (STORY-006): pass over — but do not claim — a candidate
+        // whose active state is already at its cap, so the next candidate is still
+        // considered. In-flight runs are never affected (ADR-007).
+        if at_status_cap(&active_state) {
             continue;
         }
         match dispatch_gate(tracker, &mapping, &candidate) {
@@ -459,7 +479,8 @@ where
     A: AgentAdapter,
     R: FnOnce(&Candidate),
 {
-    let dispatch = match dispatch_one(tracker, store, config, now, holder, on_activated) {
+    let dispatch = match dispatch_one(tracker, store, config, now, holder, on_activated, |_| false)
+    {
         DispatchOutcome::Dispatched(dispatch) => dispatch,
         DispatchOutcome::NoDispatch(report) => return report,
     };

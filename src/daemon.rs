@@ -48,6 +48,10 @@ impl DaemonState {
 struct RunningItem {
     id: String,
     identifier: String,
+    /// The active state this worker occupies (`config.transitions.claim`,
+    /// lowercased): the key the per-status concurrency cap tallies against
+    /// (STORY-006, ADR-007).
+    state: String,
     started_at_ms: u64,
     handle: JoinHandle<()>,
 }
@@ -313,10 +317,38 @@ where
             // distinct candidates), the pass stops and its report is mirrored.
             let config = config_rx.borrow().clone();
             let now = now_ms();
+            // The active state a claimed worker will occupy (ADR-008); the
+            // per-status cap (STORY-006) tallies live workers against it.
+            let active_state = config.transitions.claim.to_lowercase();
             let slots = (config.max_concurrent as usize)
                 .saturating_sub(worker_state.lock().unwrap().live_worker_count());
             for _ in 0..slots {
-                match dispatch_one(tracker.as_ref(), &store, &config, now, HOLDER, |_| {}) {
+                // Skip a candidate whose active state is already at its configured
+                // cap, reading the live registry so a within-tick burst counts too
+                // (a just-dispatched worker is pushed before the next call). No cap
+                // for the state means the global slot count alone governs (AC2).
+                let at_status_cap = |state: &str| match config.per_status_caps.get(state) {
+                    Some(&cap) => {
+                        let running = worker_state
+                            .lock()
+                            .unwrap()
+                            .running
+                            .iter()
+                            .filter(|item| item.state == state)
+                            .count();
+                        running as u32 >= cap
+                    }
+                    None => false,
+                };
+                match dispatch_one(
+                    tracker.as_ref(),
+                    &store,
+                    &config,
+                    now,
+                    HOLDER,
+                    |_| {},
+                    at_status_cap,
+                ) {
                     DispatchOutcome::Dispatched(dispatch) => {
                         let id = dispatch.candidate.id.clone();
                         let identifier = dispatch.candidate.identifier.clone();
@@ -342,6 +374,7 @@ where
                         worker_state.lock().unwrap().running.push(RunningItem {
                             id,
                             identifier,
+                            state: active_state.clone(),
                             started_at_ms,
                             handle,
                         });
@@ -1138,6 +1171,116 @@ mod tests {
             saw_third,
             "releasing a worker must let the next tick claim the deferred third"
         );
+
+        drain_all(orch, &gate).await;
+    }
+
+    // STORY-006 AC1: a per-status cap holds a status below the global limit —
+    // with max_concurrent=5 (global slots free) but the in-progress cap at 2, only
+    // two of the four eligible candidates are dispatched and the status stays there.
+    #[tokio::test]
+    async fn a_per_status_cap_holds_a_status_below_the_global_limit() {
+        let (_repo, config_path, _socket) = init_project("");
+        let (adapter, gate) = blocking_adapter();
+        let (tracker, _fetches) = multi_tracker(4);
+        let mut config = load_str(
+            r#"
+max_concurrent = 5
+[concurrency.per_status]
+"in-progress" = 2
+"#,
+        )
+        .unwrap();
+        config.poll_interval_ms = 5;
+        let orch = spawn_orchestrator(&config_path, config, tracker, adapter);
+
+        wait_for_running_count(&orch.state, 2).await;
+        // Let several poll intervals elapse: the cap must hold the status at two
+        // even though four are eligible and three global slots remain free.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        {
+            let state = orch.state.lock().unwrap();
+            assert_eq!(
+                state.running.len(),
+                2,
+                "the in-progress cap of 2 holds even with global slots free"
+            );
+            assert!(
+                state.running.iter().all(|item| item.state == "in-progress"),
+                "the tracked workers occupy the capped active state"
+            );
+        }
+
+        drain_all(orch, &gate).await;
+    }
+
+    // STORY-006 AC2: a status with no configured cap falls back to the global
+    // limit. A cap on an unrelated state ("review") never matches the active state
+    // ("in-progress"), so the global cap of 2 alone governs.
+    #[tokio::test]
+    async fn an_uncapped_status_dispatches_up_to_the_global_limit() {
+        let (_repo, config_path, _socket) = init_project("");
+        let (adapter, gate) = blocking_adapter();
+        let (tracker, _fetches) = multi_tracker(3);
+        let mut config = load_str(
+            r#"
+max_concurrent = 2
+[concurrency.per_status]
+"review" = 1
+"#,
+        )
+        .unwrap();
+        config.poll_interval_ms = 5;
+        let orch = spawn_orchestrator(&config_path, config, tracker, adapter);
+
+        wait_for_running_count(&orch.state, 2).await;
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        {
+            let state = orch.state.lock().unwrap();
+            assert_eq!(
+                state.running.len(),
+                2,
+                "the uncapped active state fills up to the global limit of 2"
+            );
+            let ids: Vec<_> = state.running.iter().map(|item| item.id.clone()).collect();
+            assert!(
+                !ids.contains(&"ITER-003".to_string()),
+                "the global cap defers the third: {ids:?}"
+            );
+        }
+
+        drain_all(orch, &gate).await;
+    }
+
+    // STORY-006 AC3: a cap key differing only by case matches the active state
+    // after lowercase normalization. "In-Progress" caps the "in-progress" active
+    // state at 1, holding it there even with global slots free.
+    #[tokio::test]
+    async fn a_mixed_case_cap_key_matches_the_active_state() {
+        let (_repo, config_path, _socket) = init_project("");
+        let (adapter, gate) = blocking_adapter();
+        let (tracker, _fetches) = multi_tracker(3);
+        let mut config = load_str(
+            r#"
+max_concurrent = 5
+[concurrency.per_status]
+"In-Progress" = 1
+"#,
+        )
+        .unwrap();
+        config.poll_interval_ms = 5;
+        let orch = spawn_orchestrator(&config_path, config, tracker, adapter);
+
+        wait_for_running_count(&orch.state, 1).await;
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        {
+            let state = orch.state.lock().unwrap();
+            assert_eq!(
+                state.running.len(),
+                1,
+                "the mixed-case cap of 1 matches in-progress and holds it below the global limit"
+            );
+        }
 
         drain_all(orch, &gate).await;
     }
