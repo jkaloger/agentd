@@ -1,7 +1,7 @@
 ---
 title: Continuation retry after clean worker exit
 type: iteration
-status: review
+status: complete
 author: Jack Kaloger
 date: 2026-07-14
 tags: []
@@ -16,7 +16,7 @@ On a clean worker exit, schedule a continuation instead of finalizing: remove th
 - Implements: STORY-007 (ACs there).
 - Architecture: [[ADR-004]] — the claude adapter runs one-shot turns; continuation is re-dispatch, and only "if the doc is still active". [[ADR-002]] — retry schedules are durable, eligibility re-derived from `due_at` (no serialized timer).
 - The retry store — `RetryRecord`, `schedule_retry`, `due_retries`, `clear_retry`, `release` — landed in `src/store.rs` via ITERATION-019 (STORY-018, complete). This slice is the first writer of a continuation schedule; the fire handler that reads it is ITERATION-031 (STORY-009).
-- Touch: `src/store.rs` `schedule_retry` + `RetryRecord`; `src/tick.rs` `run_tick` clean branch (`clean`/`claim_released`, `TickReport::Dispatched(RunRecord)`) — the clean-exit signal; `src/daemon.rs` `spawn_orchestrator` worker body (`state.running.retain` + `state.records.push` already do the running-entry removal and totals) — add the `schedule_retry` on clean exit.
+- Touch: `src/store.rs` `schedule_retry` + `RetryRecord`; `src/daemon.rs` completion routing — post-substrate ([[ITERATION-037]]) the clean-exit signal is the `WorkerCompletion`/`RunRecord` (`clean`/`claim_released`) handled in `handle_completion`, where the running-entry removal (`state.running.retain`) and terminal-record push (totals) already live; add the `schedule_retry` there on a clean exit. (`run_tick` is now a `#[cfg(test)]` composition; the production path is `dispatch_one`/`run_worker`/`finalize`/`handle_completion`.)
 
 ## Satisfies
 STORY-007 AC1 directly. AC2/AC3 (the fire outcomes — re-dispatch a fresh session when still active with a slot, release otherwise) are realized by ITERATION-031's retry-timer-fire handler consulting the schedule this slice writes.

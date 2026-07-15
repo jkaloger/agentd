@@ -25,6 +25,12 @@ use crate::workspace::DiskWorktrees;
 
 const HOLDER: &str = "agentd";
 
+/// How long after a clean worker exit the continuation retry becomes eligible
+/// (STORY-007 AC1). A clean turn does not finalize the item (ADR-004): the claim
+/// is held and this attempt-1 retry is scheduled so the fire handler (ITERATION-031)
+/// re-checks the doc shortly after and re-dispatches it while it is still active.
+const CONTINUATION_RETRY_MS: u64 = 1000;
+
 type SharedState = Arc<Mutex<DaemonState>>;
 
 #[derive(Default)]
@@ -437,6 +443,10 @@ fn handle_completion(
     snapshot: &Snapshot,
     state: &SharedState,
 ) {
+    // A clean turn does not finalize (ADR-004): `run_worker` retains the claim
+    // (`release_claim` false) rather than releasing it. Read the flag before
+    // `finalize` consumes the completion so the continuation can be scheduled.
+    let clean = !completion.release_claim;
     let record = finalize(store, completion);
     // Post-commit seam (ADR-002): the claim/advance already committed durably;
     // this only best-effort mirrors that outcome to the plain-text log/snapshot.
@@ -459,6 +469,14 @@ fn handle_completion(
     }
     if let Ok(claims) = store.claims() {
         snapshot.write_state(&claims);
+    }
+
+    // A clean exit is a continuation, not a finalize (STORY-007 AC1): the claim
+    // stays held and a durable attempt-1 retry is scheduled ~1s out. The fire
+    // handler (ITERATION-031) consumes it to re-dispatch while the doc is active
+    // or release otherwise; nothing here reads, releases, or re-dispatches.
+    if clean {
+        let _ = store.schedule_retry(&record.id, 1, "", now_ms() + CONTINUATION_RETRY_MS);
     }
 
     let mut state = state.lock().unwrap();
@@ -895,6 +913,42 @@ mod tests {
         (BlockingAdapter { gate: gate.clone() }, gate)
     }
 
+    /// Like `BlockingAdapter` but its gated turn resolves to a failure, so the
+    /// worker takes the failure transition and releases its claim — the contrast
+    /// to a clean exit for the continuation-retry test.
+    struct FailingBlockingAdapter {
+        gate: Arc<Notify>,
+    }
+
+    impl AgentAdapter for FailingBlockingAdapter {
+        type Session = Worktree;
+
+        fn start_session(&self, worktree: Worktree) -> Worktree {
+            worktree
+        }
+
+        async fn run_turn(&self, _session: &Worktree, _prompt: &str) -> TurnReport {
+            self.gate.notified().await;
+            TurnReport {
+                outcome: TurnOutcome::Failed {
+                    reason: "boom".to_string(),
+                },
+                events: vec![AgentEvent::TurnFailed {
+                    pid: 1,
+                    at_ms: 1,
+                    reason: "boom".to_string(),
+                }],
+            }
+        }
+
+        async fn stop(&self, _session: Worktree) {}
+    }
+
+    fn failing_blocking_adapter() -> (FailingBlockingAdapter, Arc<Notify>) {
+        let gate = Arc::new(Notify::new());
+        (FailingBlockingAdapter { gate: gate.clone() }, gate)
+    }
+
     /// The sandbox denies `AF_UNIX` bind (Operation not permitted). Socket
     /// round-trip tests probe for it and skip rather than fail; the socket-free
     /// orchestration test below still covers the dispatch path there.
@@ -1085,6 +1139,107 @@ mod tests {
         assert!(
             store.get("ITER-001").unwrap().is_some(),
             "a clean turn's claim must be retained in the store"
+        );
+    }
+
+    // STORY-007 AC1: a clean worker exit does not finalize — it removes the running
+    // entry, records the run's totals, holds the claim, and schedules a durable
+    // attempt-1 continuation retry due ~1s out for the fire handler to consume.
+    #[tokio::test]
+    async fn a_clean_exit_holds_the_claim_and_schedules_an_attempt_one_continuation() {
+        let (_repo, config_path, _socket) = init_project("");
+        let store_dir = config_path.parent().unwrap().to_path_buf();
+        let (adapter, gate) = blocking_adapter();
+        let (tracker, _fetches) = multi_tracker(1);
+        let mut config = load_str("").unwrap();
+        config.poll_interval_ms = 5;
+        let orch = spawn_orchestrator(&config_path, config, tracker, adapter);
+
+        wait_for_running(&orch.state).await;
+        let before = now_ms();
+        gate.notify_one();
+        wait_for_records(&orch.state, 1).await;
+        {
+            let state = orch.state.lock().unwrap();
+            assert!(
+                state.running.iter().all(|item| item.id != "ITER-001"),
+                "a clean exit must remove the running entry"
+            );
+            let record = state
+                .records
+                .iter()
+                .find(|r| r.id == "ITER-001")
+                .expect("the run's totals must be recorded");
+            assert!(
+                !record.claim_released,
+                "a clean exit holds the claim, deferring the release decision"
+            );
+        }
+
+        drain_all(orch, &gate).await;
+
+        // The loop is torn down, so the store file is free to reopen.
+        let store = Store::open(&store_dir.join("store.redb")).unwrap();
+        assert!(
+            store.get("ITER-001").unwrap().is_some(),
+            "the claim must still be held after a clean exit"
+        );
+        let retries = store.retries().unwrap();
+        let (_, retry) = retries
+            .iter()
+            .find(|(id, _)| id == "ITER-001")
+            .expect("a clean exit must schedule a durable continuation retry");
+        assert_eq!(retry.attempt, 1, "the continuation is attempt 1");
+        assert!(
+            retry.due_at >= before + CONTINUATION_RETRY_MS
+                && retry.due_at <= now_ms() + CONTINUATION_RETRY_MS,
+            "the continuation is due ~1s out: {} not in [{}, {}]",
+            retry.due_at,
+            before + CONTINUATION_RETRY_MS,
+            now_ms() + CONTINUATION_RETRY_MS
+        );
+    }
+
+    // STORY-007 AC1 (contrast): a failed exit still finalizes as before — the claim
+    // is released and no continuation retry is scheduled.
+    #[tokio::test]
+    async fn a_failed_exit_releases_the_claim_and_schedules_no_continuation() {
+        let (_repo, config_path, _socket) = init_project("");
+        let store_dir = config_path.parent().unwrap().to_path_buf();
+        let (adapter, gate) = failing_blocking_adapter();
+        let (tracker, _fetches) = multi_tracker(1);
+        let mut config = load_str("").unwrap();
+        config.poll_interval_ms = 5;
+        let orch = spawn_orchestrator(&config_path, config, tracker, adapter);
+
+        wait_for_running(&orch.state).await;
+        gate.notify_one();
+        wait_for_records(&orch.state, 1).await;
+        {
+            let state = orch.state.lock().unwrap();
+            let record = state
+                .records
+                .iter()
+                .find(|r| r.id == "ITER-001")
+                .expect("the failed run must be recorded");
+            assert!(
+                record.claim_released,
+                "a failed exit releases the claim, as the inline path did"
+            );
+        }
+
+        drain_all(orch, &gate).await;
+
+        // A failed exit is a finalize, not a continuation: no retry is scheduled
+        // for it (a re-dispatched worker stays gated and is aborted on shutdown).
+        let store = Store::open(&store_dir.join("store.redb")).unwrap();
+        assert!(
+            store
+                .retries()
+                .unwrap()
+                .iter()
+                .all(|(id, _)| id != "ITER-001"),
+            "a failed exit must not schedule a continuation retry"
         );
     }
 
