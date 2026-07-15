@@ -1,7 +1,7 @@
 ---
 title: Convert run_tick to a tracked concurrent worker pool
 type: iteration
-status: in-progress
+status: complete
 author: Jack Kaloger
 date: 2026-07-15
 tags: []

@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::adapter::AgentAdapter;
@@ -16,8 +16,11 @@ use crate::mapping::{DagSource, MappingError, RoleMapping};
 use crate::projection::{EventKind, Projection, Snapshot};
 use crate::prompt;
 use crate::store::Store;
-use crate::tick::{RunRecord, SkipClaim, TickReport, reconcile, run_tick};
-use crate::tracker::{Candidate, Tracker};
+use crate::tick::{
+    DispatchOutcome, RunRecord, SkipClaim, TickReport, WorkerCompletion, dispatch_one, finalize,
+    reconcile, run_worker,
+};
+use crate::tracker::Tracker;
 use crate::workspace::DiskWorktrees;
 
 const HOLDER: &str = "agentd";
@@ -30,13 +33,23 @@ struct DaemonState {
     records: Vec<RunRecord>,
 }
 
-/// An item published as Running the moment it is claimed and activated, before
-/// its turn finishes. It is dropped from `running` and replaced by a terminal
-/// `RunRecord` once the tick resolves.
+impl DaemonState {
+    /// The number of live workers in the registry (ADR-008, STORY-069 AC4): the
+    /// count the concurrency caps (STORY-005/006) will consume to compute free
+    /// slots, and runtime truth for how many agents are running.
+    fn live_worker_count(&self) -> usize {
+        self.running.len()
+    }
+}
+
+/// A live worker in the registry (ADR-008): published as Running the moment it is
+/// dispatched, holding its abort handle so shutdown/stall can stop it, until its
+/// turn resolves and it is replaced by a terminal `RunRecord`.
 struct RunningItem {
     id: String,
     identifier: String,
     started_at_ms: u64,
+    handle: JoinHandle<()>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -213,12 +226,18 @@ struct Orchestrator {
     worker_handles: Vec<JoinHandle<()>>,
 }
 
-/// Reconcile the store once, then poll: run a tick, wait `poll_interval_ms`, and
-/// tick again, until shutdown. Each tick publishes the claimed item as Running the
-/// moment it is activated and replaces it with a terminal record when the turn
-/// resolves. Ticks are sequential — the next wait starts only when the current
-/// tick's post-commit seam completes, so no two ticks overlap. No socket is bound
-/// here.
+/// Reconcile the store once, then poll a bounded pool of tracked concurrent
+/// workers (ADR-008): each cycle fills the free slots — `max_concurrent` minus the
+/// live workers in the registry — by dispatching candidates in priority order,
+/// spawning one worker per claim WITHOUT awaiting its turn. A worker publishes its
+/// item as Running the moment it is dispatched and reports its resolved outcome
+/// back over an mpsc channel; the loop applies the store/projection/snapshot
+/// mirroring and drops it from the registry. The loop never blocks on a turn — it
+/// `select!`s the poll timer against worker completions and the shutdown watch. No
+/// socket is bound here.
+///
+/// Store, projection, and snapshot are single-owner in this loop task; workers
+/// send data back and never touch them, so completion never races the store.
 fn spawn_orchestrator<T, A>(
     config_path: &Path,
     config: Config,
@@ -244,6 +263,8 @@ where
     let store_path = store_dir.join("store.redb");
     let log_path = store_dir.join("log");
     let template = read_template(&repo, &config);
+    let tracker = Arc::new(tracker);
+    let adapter = Arc::new(adapter);
     let worker_state = state.clone();
     let (config_tx, config_rx) = watch::channel(config);
     let mut shutdown_rx = shutdown_tx.subscribe();
@@ -255,13 +276,14 @@ where
         };
         let projection = Projection::new(log_path);
         let snapshot = Snapshot::new(store_dir);
+        let (completion_tx, mut completion_rx) = mpsc::unbounded_channel::<WorkerCompletion>();
 
         {
             let config = config_rx.borrow().clone();
             let now = now_ms();
             let mapping = RoleMapping::from_config(&config);
             let worktrees = DiskWorktrees::new(repo.join(&config.workspace.root));
-            if let Ok(report) = reconcile(&store, &tracker, &worktrees, &mapping, now) {
+            if let Ok(report) = reconcile(&store, tracker.as_ref(), &worktrees, &mapping, now) {
                 // A daemon restart, not a new commit: there is no live holder to
                 // attribute the release to, so the line carries only the id. Expired
                 // orphans, vanished-doc drops, completed finalizations, and claims
@@ -284,109 +306,82 @@ where
         }
 
         loop {
-            let now = now_ms();
+            // Fill free slots (ADR-007/ADR-008): dispatch up to `max_concurrent`
+            // minus the live workers, in priority order, spawning a worker per
+            // claim without awaiting its turn. Once no eligible candidate remains
+            // (`dispatch_one` skips live-claimed ids, so consecutive calls select
+            // distinct candidates), the pass stops and its report is mirrored.
             let config = config_rx.borrow().clone();
-
-            let running_state = worker_state.clone();
-            let on_activated = move |candidate: &Candidate| {
-                running_state.lock().unwrap().running.push(RunningItem {
-                    id: candidate.id.clone(),
-                    identifier: candidate.identifier.clone(),
-                    started_at_ms: now_ms(),
-                });
-            };
-
-            let report = run_tick(
-                &tracker,
-                &store,
-                &adapter,
-                &config,
-                &template,
-                &repo,
-                now,
-                HOLDER,
-                on_activated,
-            )
-            .await;
-
-            match report {
-                TickReport::Dispatched(record) => {
-                    // Post-commit seam (ADR-002): the store transaction already
-                    // committed inside `run_tick`/`claim_and_activate`; this only
-                    // best-effort mirrors that outcome to the plain-text log.
-                    projection.record(
-                        record.claimed_at_ms,
-                        &record.id,
-                        EventKind::Claim,
-                        &[("holder", &record.holder)],
-                    );
-                    if record.claim_released {
-                        projection.record(
-                            record.ended_at_ms,
-                            &record.id,
-                            EventKind::Release,
-                            &[("holder", &record.holder)],
-                        );
-                        snapshot.remove_ref(&record.id);
-                    } else if let Ok(Some(held)) = store.get(&record.id) {
-                        snapshot.set_ref(&record.id, &held.holder, held.fence);
+            let now = now_ms();
+            let slots = (config.max_concurrent as usize)
+                .saturating_sub(worker_state.lock().unwrap().live_worker_count());
+            for _ in 0..slots {
+                match dispatch_one(tracker.as_ref(), &store, &config, now, HOLDER, |_| {}) {
+                    DispatchOutcome::Dispatched(dispatch) => {
+                        let id = dispatch.candidate.id.clone();
+                        let identifier = dispatch.candidate.identifier.clone();
+                        let started_at_ms = now_ms();
+                        let worker_tracker = tracker.clone();
+                        let worker_adapter = adapter.clone();
+                        let worker_config = config.clone();
+                        let worker_template = template.clone();
+                        let worker_repo = repo.clone();
+                        let tx = completion_tx.clone();
+                        let handle = tokio::spawn(async move {
+                            let completion = run_worker(
+                                worker_tracker.as_ref(),
+                                worker_adapter.as_ref(),
+                                &worker_config,
+                                &worker_template,
+                                &worker_repo,
+                                dispatch,
+                            )
+                            .await;
+                            let _ = tx.send(completion);
+                        });
+                        worker_state.lock().unwrap().running.push(RunningItem {
+                            id,
+                            identifier,
+                            started_at_ms,
+                            handle,
+                        });
                     }
-                    if let Ok(claims) = store.claims() {
-                        snapshot.write_state(&claims);
-                    }
-
-                    let mut state = worker_state.lock().unwrap();
-                    state.running.retain(|item| item.id != record.id);
-                    state.records.push(*record);
-                }
-                // Same post-commit seam as above (STORY-019 AC1): a gated-out advance
-                // still durably claims-then-releases before the tick reports Skipped,
-                // so those commits must reach the log and snapshot too. A lost claim
-                // never touched the store, so it projects nothing.
-                TickReport::Skipped { id, claim, .. } => match claim {
-                    SkipClaim::ClaimedThenReleased => {
-                        projection.record(now, &id, EventKind::Claim, &[("holder", HOLDER)]);
-                        projection.record(now, &id, EventKind::Release, &[("holder", HOLDER)]);
-                        snapshot.remove_ref(&id);
-                        if let Ok(claims) = store.claims() {
-                            snapshot.write_state(&claims);
-                        }
-                    }
-                    SkipClaim::ClaimedReleaseFailed => {
-                        projection.record(now, &id, EventKind::Claim, &[("holder", HOLDER)]);
-                        if let Ok(Some(held)) = store.get(&id) {
-                            snapshot.set_ref(&id, &held.holder, held.fence);
-                        }
-                        if let Ok(claims) = store.claims() {
-                            snapshot.write_state(&claims);
-                        }
-                    }
-                    SkipClaim::NotClaimed => {}
-                },
-                // The blocker gate held every eligible candidate back (STORY-061
-                // AC1). Nothing was claimed, so there is no store change to mirror;
-                // record each reason to the log so it is durable and inspectable.
-                TickReport::Blocked(blocked) => {
-                    for candidate in blocked {
-                        projection.record(
-                            now,
-                            &candidate.id,
-                            EventKind::Blocked,
-                            &[("reason", &candidate.reason)],
-                        );
+                    DispatchOutcome::NoDispatch(report) => {
+                        mirror_nondispatch(report, &projection, &snapshot, &store, now);
+                        break;
                     }
                 }
-                TickReport::Idle | TickReport::Error(_) => {}
             }
 
-            // Re-read the interval fresh so a reload governs the next wait only,
-            // never an in-flight tick (ADR-006/ADR-007). The sleep races the
-            // shutdown watch so the loop exits promptly instead of after a full wait.
+            // Re-read the interval fresh so a reload governs the next wait only
+            // (ADR-006/ADR-007). The loop never blocks on a turn: it races the poll
+            // timer against worker completions (handled promptly, freeing a slot the
+            // next pass fills) and the shutdown watch.
             let interval = config_rx.borrow().poll_interval_ms;
             tokio::select! {
                 _ = wait_true(&mut shutdown_rx) => break,
+                Some(completion) = completion_rx.recv() => {
+                    handle_completion(completion, &store, &projection, &snapshot, &worker_state);
+                }
                 _ = tokio::time::sleep(Duration::from_millis(interval)) => {}
             }
+        }
+
+        // Shutdown: stop dispatching and stop the in-flight workers so the process
+        // does not hang on live handles. Aborting leaves their durable claims for
+        // restart reconcile (ADR-002); a graceful drain is STORY-067.
+        let handles: Vec<JoinHandle<()>> = worker_state
+            .lock()
+            .unwrap()
+            .running
+            .drain(..)
+            .map(|item| item.handle)
+            .collect();
+        for handle in &handles {
+            handle.abort();
+        }
+        for handle in handles {
+            let _ = handle.await;
         }
     })];
 
@@ -395,6 +390,93 @@ where
         shutdown_tx,
         config_tx,
         worker_handles,
+    }
+}
+
+/// Apply a finished worker's resolved outcome (ADR-008, STORY-069 AC3): release
+/// the claim if the branch requires it (`finalize`, store single-owner here),
+/// mirror the durable outcome to the log/snapshot exactly as the inline path did,
+/// then drop the worker from the registry and record its terminal trace.
+fn handle_completion(
+    completion: WorkerCompletion,
+    store: &Store,
+    projection: &Projection,
+    snapshot: &Snapshot,
+    state: &SharedState,
+) {
+    let record = finalize(store, completion);
+    // Post-commit seam (ADR-002): the claim/advance already committed durably;
+    // this only best-effort mirrors that outcome to the plain-text log/snapshot.
+    projection.record(
+        record.claimed_at_ms,
+        &record.id,
+        EventKind::Claim,
+        &[("holder", &record.holder)],
+    );
+    if record.claim_released {
+        projection.record(
+            record.ended_at_ms,
+            &record.id,
+            EventKind::Release,
+            &[("holder", &record.holder)],
+        );
+        snapshot.remove_ref(&record.id);
+    } else if let Ok(Some(held)) = store.get(&record.id) {
+        snapshot.set_ref(&record.id, &held.holder, held.fence);
+    }
+    if let Ok(claims) = store.claims() {
+        snapshot.write_state(&claims);
+    }
+
+    let mut state = state.lock().unwrap();
+    state.running.retain(|item| item.id != record.id);
+    state.records.push(record);
+}
+
+/// Mirror a dispatch pass that produced no worker (STORY-019 AC1 / STORY-061 AC1).
+/// A gated-out advance still durably claims-then-releases before reporting
+/// `Skipped`, so both commits must reach the log and snapshot; a blocked candidate
+/// records its reason. A lost claim, `Idle`, and `Error` touch nothing durable.
+fn mirror_nondispatch(
+    report: TickReport,
+    projection: &Projection,
+    snapshot: &Snapshot,
+    store: &Store,
+    now: u64,
+) {
+    match report {
+        TickReport::Skipped { id, claim, .. } => match claim {
+            SkipClaim::ClaimedThenReleased => {
+                projection.record(now, &id, EventKind::Claim, &[("holder", HOLDER)]);
+                projection.record(now, &id, EventKind::Release, &[("holder", HOLDER)]);
+                snapshot.remove_ref(&id);
+                if let Ok(claims) = store.claims() {
+                    snapshot.write_state(&claims);
+                }
+            }
+            SkipClaim::ClaimedReleaseFailed => {
+                projection.record(now, &id, EventKind::Claim, &[("holder", HOLDER)]);
+                if let Ok(Some(held)) = store.get(&id) {
+                    snapshot.set_ref(&id, &held.holder, held.fence);
+                }
+                if let Ok(claims) = store.claims() {
+                    snapshot.write_state(&claims);
+                }
+            }
+            SkipClaim::NotClaimed => {}
+        },
+        TickReport::Blocked(blocked) => {
+            for candidate in blocked {
+                projection.record(
+                    now,
+                    &candidate.id,
+                    EventKind::Blocked,
+                    &[("reason", &candidate.reason)],
+                );
+            }
+        }
+        // `dispatch_one` never returns a completed dispatch through `NoDispatch`.
+        TickReport::Idle | TickReport::Error(_) | TickReport::Dispatched(_) => {}
     }
 }
 
@@ -582,7 +664,7 @@ mod tests {
     use crate::agent::AgentEvent;
     use crate::config::load_str;
     use crate::mapping::StubDag;
-    use crate::tracker::{DocLookup, DocView, TrackerError};
+    use crate::tracker::{Candidate, DocLookup, DocView, TrackerError};
     use crate::workspace::Worktree;
 
     /// A tracker fake offering one candidate, a canned parent for prompt
@@ -613,6 +695,67 @@ mod tests {
         fn advance(&self, _id: &str, _target: &str) -> Result<(), TrackerError> {
             Ok(())
         }
+    }
+
+    /// A tracker fake offering several candidates at once, all sharing one terminal
+    /// parent so each clears the blocker gate and assembles a prompt. Advances are
+    /// no-ops (the store's live claim, not the tracker, dedups a claimed id), so
+    /// `fetch_dispatchable` keeps returning the whole set — exactly how the daemon
+    /// fills free slots with distinct candidates (ADR-008).
+    struct MultiTracker {
+        candidates: Vec<Candidate>,
+        parent: DocView,
+        fetches: Arc<AtomicUsize>,
+    }
+
+    impl Tracker for MultiTracker {
+        fn fetch_dispatchable(&self) -> Result<Vec<Candidate>, TrackerError> {
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            Ok(self.candidates.clone())
+        }
+
+        fn fetch_doc(&self, _id: &str) -> Result<DocView, TrackerError> {
+            Ok(self.parent.clone())
+        }
+
+        fn lookup_doc(&self, _id: &str) -> Result<DocLookup, TrackerError> {
+            Ok(DocLookup::Present(self.parent.clone()))
+        }
+
+        fn advance(&self, _id: &str, _target: &str) -> Result<(), TrackerError> {
+            Ok(())
+        }
+    }
+
+    /// `n` eligible candidates (`ITER-001`..`ITER-00n`) in priority order, each
+    /// under a terminal parent, plus a handle to the shared fetch counter.
+    fn multi_tracker(n: usize) -> (MultiTracker, Arc<AtomicUsize>) {
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let candidates = (1..=n)
+            .map(|i| Candidate {
+                id: format!("ITER-{i:03}"),
+                identifier: format!("iter-{i}"),
+                title: format!("Iteration {i}"),
+                body: "Objective: prove concurrency.".to_string(),
+                state: "accepted".to_string(),
+                parent: Some("STORY-060".to_string()),
+                dependencies: Vec::new(),
+                priority: Some(i as u32),
+                created_at: "2026-07-13".to_string(),
+            })
+            .collect();
+        let tracker = MultiTracker {
+            candidates,
+            parent: DocView {
+                id: "STORY-060".to_string(),
+                doc_type: "story".to_string(),
+                title: "Concurrency substrate".to_string(),
+                body: "As the daemon, I run tracked concurrent workers.".to_string(),
+                status: "complete".to_string(),
+            },
+            fetches: fetches.clone(),
+        };
+        (tracker, fetches)
     }
 
     /// An adapter fake whose turn blocks on a gate until the test releases it, so
@@ -783,6 +926,222 @@ mod tests {
         }
     }
 
+    /// Shut the loop down, releasing every still-blocked turn so no worker hangs.
+    async fn drain_all(orch: Orchestrator, gate: &Arc<Notify>) {
+        let _ = orch.shutdown_tx.send(true);
+        gate.notify_waiters();
+        for handle in orch.worker_handles {
+            handle.await.unwrap();
+        }
+    }
+
+    async fn wait_for_running_count(state: &SharedState, n: usize) {
+        for _ in 0..400 {
+            if state.lock().unwrap().running.len() >= n {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("fewer than {n} workers appeared in the registry");
+    }
+
+    // STORY-069 AC1: given free slots and several eligible candidates, a tick
+    // dispatches more than one — each as its own worker — before any earlier
+    // worker's turn finishes. With every turn gated shut, two workers stand tracked
+    // and nothing has completed.
+    #[tokio::test]
+    async fn several_eligible_candidates_spawn_concurrent_workers() {
+        let (_repo, config_path, _socket) = init_project("");
+        let (adapter, gate) = blocking_adapter();
+        let (tracker, _fetches) = multi_tracker(3);
+        let mut config = load_str("").unwrap();
+        config.poll_interval_ms = 5;
+        let orch = spawn_orchestrator(&config_path, config, tracker, adapter);
+
+        wait_for_running_count(&orch.state, 2).await;
+        {
+            let state = orch.state.lock().unwrap();
+            assert!(
+                state.running.len() >= 2,
+                "more than one worker must be dispatched before any completes"
+            );
+            assert!(
+                state.records.is_empty(),
+                "no worker may complete while every turn is still blocked"
+            );
+        }
+
+        drain_all(orch, &gate).await;
+    }
+
+    // STORY-069 AC2: once a worker is dispatched, the tick returns without blocking
+    // on the agent turn — the poll loop keeps fetching on cadence — and the worker
+    // is recorded in the live registry keyed by work-item id.
+    #[tokio::test]
+    async fn dispatch_tracks_the_worker_and_the_loop_never_blocks_on_the_turn() {
+        let (_repo, config_path, _socket) = init_project("");
+        let (adapter, gate) = blocking_adapter();
+        let (tracker, fetches) = multi_tracker(1);
+        let mut config = load_str("").unwrap();
+        config.poll_interval_ms = 5;
+        let orch = spawn_orchestrator(&config_path, config, tracker, adapter);
+
+        wait_for_running(&orch.state).await;
+        {
+            let state = orch.state.lock().unwrap();
+            assert_eq!(state.running.len(), 1);
+            assert_eq!(
+                state.running[0].id, "ITER-001",
+                "the worker is tracked keyed by its work-item id"
+            );
+            assert!(state.records.is_empty());
+        }
+
+        // The turn is still blocked, yet the loop keeps ticking: further fetches
+        // prove it did not block on the agent turn.
+        let before = fetches.load(Ordering::SeqCst);
+        wait_for_fetches(&fetches, before + 2).await;
+        assert!(
+            orch.state.lock().unwrap().records.is_empty(),
+            "the blocked turn must not have resolved"
+        );
+
+        drain_all(orch, &gate).await;
+    }
+
+    // STORY-069 AC3: a finished worker resolves its outcome into the same mapped
+    // transition and claim retention as the inline path (a clean turn advances to
+    // the success state and keeps its claim), then leaves the registry.
+    #[tokio::test]
+    async fn a_finished_worker_resolves_its_outcome_and_leaves_the_registry() {
+        let (_repo, config_path, _socket) = init_project("");
+        let store_dir = config_path.parent().unwrap().to_path_buf();
+        let (adapter, gate) = blocking_adapter();
+        let (tracker, _fetches) = multi_tracker(1);
+        let mut config = load_str("").unwrap();
+        config.poll_interval_ms = 5;
+        let orch = spawn_orchestrator(&config_path, config, tracker, adapter);
+
+        wait_for_running(&orch.state).await;
+        gate.notify_one();
+        wait_for_records(&orch.state, 1).await;
+        {
+            let state = orch.state.lock().unwrap();
+            assert!(
+                state.running.iter().all(|item| item.id != "ITER-001"),
+                "a finished worker must leave the registry"
+            );
+            let record = state
+                .records
+                .iter()
+                .find(|r| r.id == "ITER-001")
+                .expect("the finished worker's record");
+            let transition = record.transition.as_ref().expect("a resolved transition");
+            assert_eq!(transition.target_state, "complete");
+            assert!(
+                !record.claim_released,
+                "a clean turn retains its claim, as the inline path did"
+            );
+        }
+
+        drain_all(orch, &gate).await;
+
+        // The retained claim is durable in the store (loop is torn down, so the
+        // file is free to reopen).
+        let store = Store::open(&store_dir.join("store.redb")).unwrap();
+        assert!(
+            store.get("ITER-001").unwrap().is_some(),
+            "a clean turn's claim must be retained in the store"
+        );
+    }
+
+    // STORY-069 AC4: the orchestrator reports the count of live workers straight
+    // from the registry — the substrate the concurrency caps consume.
+    #[tokio::test]
+    async fn the_live_worker_count_reflects_the_registry() {
+        let (_repo, config_path, _socket) = init_project("");
+        let (adapter, gate) = blocking_adapter();
+        let (tracker, _fetches) = multi_tracker(3);
+        let mut config = load_str("").unwrap();
+        config.poll_interval_ms = 5;
+        let orch = spawn_orchestrator(&config_path, config, tracker, adapter);
+
+        wait_for_running_count(&orch.state, 2).await;
+        {
+            let state = orch.state.lock().unwrap();
+            assert_eq!(
+                state.live_worker_count(),
+                2,
+                "max_concurrent=2 fills exactly two slots"
+            );
+            assert_eq!(
+                state.live_worker_count(),
+                state.running.len(),
+                "the count is the registry's size"
+            );
+        }
+
+        drain_all(orch, &gate).await;
+    }
+
+    // STORY-069 AC5 + Verification: with max_concurrent=2 and three eligible
+    // candidates whose turns block, exactly two workers are spawned and tracked and
+    // the third is not claimed; releasing one worker frees a slot so the next tick
+    // claims the third.
+    #[tokio::test]
+    async fn a_full_pool_defers_the_third_until_a_worker_frees_a_slot() {
+        let (_repo, config_path, _socket) = init_project("");
+        let (adapter, gate) = blocking_adapter();
+        let (tracker, _fetches) = multi_tracker(3);
+        let mut config = load_str("").unwrap();
+        config.max_concurrent = 2;
+        config.poll_interval_ms = 5;
+        let orch = spawn_orchestrator(&config_path, config, tracker, adapter);
+
+        wait_for_running_count(&orch.state, 2).await;
+        // Let several poll intervals elapse: the third must stay unclaimed while the
+        // pool is full, and both blocked turns reach their gate await.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        {
+            let state = orch.state.lock().unwrap();
+            assert_eq!(
+                state.running.len(),
+                2,
+                "exactly two workers while max_concurrent=2 and all turns block"
+            );
+            let ids: Vec<_> = state.running.iter().map(|item| item.id.clone()).collect();
+            assert!(
+                !ids.contains(&"ITER-003".to_string()),
+                "the third must not be dispatched while the pool is full: {ids:?}"
+            );
+        }
+
+        // Release one blocked worker; the freed slot must let the next tick claim
+        // the third.
+        gate.notify_one();
+        let mut saw_third = false;
+        for _ in 0..400 {
+            if orch
+                .state
+                .lock()
+                .unwrap()
+                .running
+                .iter()
+                .any(|item| item.id == "ITER-003")
+            {
+                saw_third = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            saw_third,
+            "releasing a worker must let the next tick claim the deferred third"
+        );
+
+        drain_all(orch, &gate).await;
+    }
+
     // STORY-002 AC1: once the first tick completes, the loop waits the interval
     // and ticks again. A completed run keeps its claim, so a re-offered candidate
     // is skipped rather than re-dispatched — the faithful "another tick ran"
@@ -806,11 +1165,15 @@ mod tests {
         drain_and_shutdown(orch, &gate).await;
     }
 
-    // STORY-002 AC2: ticks never overlap. The turn stays gated shut while the
-    // short interval elapses many times over, yet exactly one turn is ever in
-    // flight and nothing completes — a concurrent model would have started more.
+    // STORY-069 (was STORY-002 AC2, re-expressed for ADR-008): a claimed item is
+    // never dispatched to a second worker. The one candidate's turn stays gated
+    // shut while the short interval elapses many times over; the fill pass keeps
+    // running but `dispatch_one` skips the live-claimed id, so the registry holds
+    // exactly one worker for it and nothing completes. (Under the concurrent model
+    // more *distinct* candidates would spawn more workers — see the pool tests —
+    // but the same id must not double-dispatch.)
     #[tokio::test]
-    async fn ticks_do_not_overlap_while_one_is_in_flight() {
+    async fn a_live_claimed_item_is_never_dispatched_to_a_second_worker() {
         let (_repo, config_path, _socket) = init_project("");
         let (adapter, gate) = blocking_adapter();
         let mut config = load_str("").unwrap();
@@ -824,11 +1187,12 @@ mod tests {
             assert_eq!(
                 state.running.len(),
                 1,
-                "one turn in flight; the next tick must not start until it completes"
+                "the live-claimed item must not be dispatched to a second worker"
             );
+            assert_eq!(state.running[0].id, "ITER-014");
             assert!(
                 state.records.is_empty(),
-                "no tick may complete while the first is still blocked"
+                "nothing may complete while the turn is still blocked"
             );
         }
 
@@ -883,17 +1247,22 @@ mod tests {
         assert_eq!(running.identifier, "execute-one-iteration");
         assert!(running.started_at_ms > 0);
 
-        // The poll loop never exits on its own; shut it down after this one tick.
-        let _ = orch.shutdown_tx.send(true);
+        // Release the turn and let the worker resolve. Under the concurrent model
+        // (ADR-008) the worker runs off the loop, so its record only lands once its
+        // completion is routed back — not by shutting the loop down.
         gate.notify_one();
-        for handle in orch.worker_handles {
-            handle.await.unwrap();
+        wait_for_records(&orch.state, 1).await;
+        {
+            let state = orch.state.lock().unwrap();
+            assert!(
+                state.running.is_empty(),
+                "the worker must leave the registry"
+            );
+            assert_eq!(state.records.len(), 1);
+            assert_eq!(state.records[0].id, "ITER-014");
         }
 
-        let state = orch.state.lock().unwrap();
-        assert!(state.running.is_empty(), "running item must be cleared");
-        assert_eq!(state.records.len(), 1);
-        assert_eq!(state.records[0].id, "ITER-014");
+        drain_and_shutdown(orch, &gate).await;
     }
 
     // STORY-016 AC1/AC3: startup reconcile releases every expired orphan and
@@ -918,8 +1287,7 @@ mod tests {
         }
 
         let (adapter, gate) = blocking_adapter();
-        let orch =
-            spawn_orchestrator(&config_path, load_str("").unwrap(), fake_tracker(), adapter);
+        let orch = spawn_orchestrator(&config_path, load_str("").unwrap(), fake_tracker(), adapter);
         // Reconcile is the one-time prelude; end the loop after it and the first tick.
         let _ = orch.shutdown_tx.send(true);
         gate.notify_one();

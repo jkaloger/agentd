@@ -24,7 +24,10 @@ const FIRST_ATTEMPT: u32 = 1;
 pub enum TickReport {
     /// Nothing was dispatch-eligible.
     Idle,
-    /// A candidate was claimed and carried through to a terminal transition.
+    /// A candidate was claimed and carried through to a terminal transition. Only
+    /// the inline `run_tick` composition (tests) produces this; the daemon splits
+    /// dispatch from completion (ADR-008) and mirrors a `RunRecord` directly.
+    #[allow(dead_code)]
     Dispatched(Box<RunRecord>),
     /// A candidate was fetched but not run — the claim was lost to another
     /// holder, or the advance-to-active was gated out (its claim was released).
@@ -180,53 +183,75 @@ fn event_label(event: &AgentEvent) -> String {
     }
 }
 
-/// Run one orchestrator tick end-to-end (STORY-060): fetch a dispatch-eligible
-/// candidate, durably claim it and advance it to the active state, prepare its
-/// isolated worktree, assemble the prompt, run the agent turn in that worktree,
-/// then resolve the outcome into the mapped lazyspec transition.
+/// The synchronous half of a tick (ADR-008): either a claimed, activated
+/// candidate ready to hand to a spawned worker, or the tick's terminal report
+/// when nothing was dispatched.
+pub enum DispatchOutcome {
+    /// A candidate was durably claimed and advanced to the active state; spawn
+    /// `run_worker` with this to run its turn.
+    Dispatched(Dispatch),
+    /// Nothing was dispatched this call — the tick's report (`Idle`/`Blocked`/
+    /// `Skipped`/`Error`). There is no worker to spawn.
+    NoDispatch(TickReport),
+}
+
+/// A claimed candidate handed from the dispatch step to a spawned worker: the
+/// candidate, its committed claim, and when it was claimed.
+pub struct Dispatch {
+    pub candidate: Candidate,
+    pub claim: ClaimRecord,
+    pub claimed_at_ms: u64,
+}
+
+/// A finished worker turn resolved into a `RunRecord`, with the claim not yet
+/// released: the store is single-owner in the orchestrator loop (ADR-008), so
+/// `finalize` performs the release there. `release_claim` carries the inline
+/// path's release/retain decision — a clean turn retains, a failure or a
+/// pre-agent fault releases.
+pub struct WorkerCompletion {
+    pub record: RunRecord,
+    pub release_claim: bool,
+}
+
+/// The dispatch half of a tick (ADR-008, STORY-069): fetch the dispatch-eligible
+/// candidates, order them (STORY-004), and select the first that is free of a
+/// live store claim and past the blocker gate (STORY-061), then durably claim it
+/// and advance it to the active state.
 ///
-/// On a non-clean turn the failure transition is applied, the store claim is
-/// released, and the worktree is left on disk for inspection (AC3). On a clean
-/// turn the claim is retained (the item is terminal and never re-offered by the
-/// role filter) so `status`/`log` can attest that it was written.
+/// On success the claimed candidate is returned for a worker to run; otherwise
+/// the tick's terminal report is returned. The turn no longer runs here — that is
+/// `run_worker`, spawned by the caller without awaiting it.
 ///
-/// Every seam is injected: the tracker, store, adapter, template source, and
-/// clock, so the whole composition is exercised without a live daemon.
+/// A live claim means the item is already running or claimed, so dispatching it
+/// again would double-run it (STORY-003 AC3); the store is the truth for claims
+/// (ADR-002). The gate holds an item until its `blocked-by` dependencies and
+/// parent are terminal-complete (STORY-061); a lookup failure is conservative —
+/// surface it, never dispatch.
 ///
 /// `on_activated` fires exactly once, after the claim and advance-to-active both
-/// succeed and before the agent runs — the seam the daemon uses to publish the
-/// item as Running while the turn is in flight.
-#[allow(clippy::too_many_arguments)]
-pub async fn run_tick<T, A, R>(
+/// succeed and before any turn runs — the seam the daemon uses to publish the
+/// item as Running.
+pub fn dispatch_one<T, R>(
     tracker: &T,
     store: &Store,
-    adapter: &A,
     config: &Config,
-    template_src: &str,
-    repo: &Path,
     now: u64,
     holder: &str,
     on_activated: R,
-) -> TickReport
+) -> DispatchOutcome
 where
     T: Tracker,
-    A: AgentAdapter,
     R: FnOnce(&Candidate),
 {
     let mut candidates = match tracker.fetch_dispatchable() {
         Ok(candidates) => candidates,
-        Err(e) => return TickReport::Error(format!("cannot fetch dispatchable candidates: {e}")),
+        Err(e) => {
+            return DispatchOutcome::NoDispatch(TickReport::Error(format!(
+                "cannot fetch dispatchable candidates: {e}"
+            )));
+        }
     };
-    // Order the eligible set so the highest-priority item is offered first when
-    // slots are scarce (STORY-004); selection below still takes the first that
-    // clears the live-claim check and the blocker gate.
     candidates.sort_by(dispatch_order);
-    // Evaluate candidates in order, dispatching the first that is both free of a
-    // live store claim and past the blocker gate. A live claim means the item is
-    // already running or claimed, so dispatching it again would double-run it
-    // (STORY-003 AC3); the store is the truth for claims (ADR-002). The gate holds
-    // an item until its `blocked-by` dependencies and parent are terminal-complete
-    // (STORY-061); a lookup failure is conservative — surface it, never dispatch.
     let mapping = RoleMapping::from_config(config);
     let mut blocked = Vec::new();
     let mut selected = None;
@@ -244,19 +269,19 @@ where
                 reason,
             }),
             Err(e) => {
-                return TickReport::Error(format!(
+                return DispatchOutcome::NoDispatch(TickReport::Error(format!(
                     "cannot evaluate blocker gate for {}: {e}",
                     candidate.id
-                ));
+                )));
             }
         }
     }
     let Some(candidate) = selected else {
-        return if blocked.is_empty() {
+        return DispatchOutcome::NoDispatch(if blocked.is_empty() {
             TickReport::Idle
         } else {
             TickReport::Blocked(blocked)
-        };
+        });
     };
 
     let claim = match claim_and_activate(
@@ -276,13 +301,51 @@ where
                 DispatchError::Advance(_) => SkipClaim::ClaimedThenReleased,
                 DispatchError::Release(_) => SkipClaim::ClaimedReleaseFailed,
             };
-            return TickReport::Skipped {
+            return DispatchOutcome::NoDispatch(TickReport::Skipped {
                 id: candidate.id,
                 reason: e.to_string(),
                 claim,
-            };
+            });
         }
     };
+
+    DispatchOutcome::Dispatched(Dispatch {
+        candidate,
+        claim,
+        claimed_at_ms: now,
+    })
+}
+
+/// The worker half of a tick (ADR-008, STORY-069): prepare the claimed
+/// candidate's isolated worktree, assemble its prompt, run the agent turn in that
+/// worktree, and resolve the outcome into a `RunRecord`.
+///
+/// The claim is released by the orchestrator loop, not here (the store is
+/// single-owner there); this returns the release/retain decision alongside the
+/// record via `WorkerCompletion`. Every inline branch is preserved exactly: a
+/// clean turn retains the claim, a failed turn takes the failure transition and
+/// releases, and a fault before the agent runs takes `fail_before_agent` (failure
+/// transition, release, any worktree left on disk).
+///
+/// Every seam is injected: the tracker, adapter, template source, and clock, so
+/// the whole composition is exercised without a live daemon.
+pub async fn run_worker<T, A>(
+    tracker: &T,
+    adapter: &A,
+    config: &Config,
+    template_src: &str,
+    repo: &Path,
+    dispatch: Dispatch,
+) -> WorkerCompletion
+where
+    T: Tracker,
+    A: AgentAdapter,
+{
+    let Dispatch {
+        candidate,
+        claim,
+        claimed_at_ms,
+    } = dispatch;
 
     let root = repo.join(&config.workspace.root);
     let started_at_ms = now_ms();
@@ -292,11 +355,10 @@ where
         Err(e) => {
             return fail_before_agent(
                 tracker,
-                store,
                 config,
                 &candidate,
                 &claim,
-                now,
+                claimed_at_ms,
                 started_at_ms,
                 None,
                 format!("cannot prepare worktree: {e}"),
@@ -309,11 +371,10 @@ where
         Err(e) => {
             return fail_before_agent(
                 tracker,
-                store,
                 config,
                 &candidate,
                 &claim,
-                now,
+                claimed_at_ms,
                 started_at_ms,
                 Some(worktree),
                 format!("cannot assemble prompt: {e}"),
@@ -333,28 +394,77 @@ where
         };
 
     let clean = matches!(report.outcome, TurnOutcome::Completed);
-    let claim_released = if clean {
-        false
-    } else {
-        store.release(&candidate.id).is_ok()
-    };
 
-    TickReport::Dispatched(Box::new(RunRecord {
-        id: candidate.id,
-        identifier: candidate.identifier,
-        title: candidate.title,
-        holder: claim.holder,
-        claimed_at_ms: now,
-        worktree: Some(worktree.path),
-        branch: Some(worktree.branch),
-        started_at_ms,
-        ended_at_ms,
-        events: report.events,
-        outcome: report.outcome,
-        transition,
-        transition_error,
-        claim_released,
-    }))
+    WorkerCompletion {
+        record: RunRecord {
+            id: candidate.id,
+            identifier: candidate.identifier,
+            title: candidate.title,
+            holder: claim.holder,
+            claimed_at_ms,
+            worktree: Some(worktree.path),
+            branch: Some(worktree.branch),
+            started_at_ms,
+            ended_at_ms,
+            events: report.events,
+            outcome: report.outcome,
+            transition,
+            transition_error,
+            claim_released: false,
+        },
+        // A clean turn retains its claim (the item is terminal and never
+        // re-offered); every other branch releases it.
+        release_claim: !clean,
+    }
+}
+
+/// Apply a finished worker's release/retain decision against the store and return
+/// the completed `RunRecord` (ADR-008). The store is single-owner in the
+/// orchestrator loop, so the release happens here rather than in the spawned
+/// worker; a clean turn retains its claim, every other branch releases.
+pub fn finalize(store: &Store, completion: WorkerCompletion) -> RunRecord {
+    let WorkerCompletion {
+        mut record,
+        release_claim,
+    } = completion;
+    if release_claim {
+        record.claim_released = store.release(&record.id).is_ok();
+    }
+    record
+}
+
+/// Run one orchestrator tick end-to-end, inline (STORY-060): dispatch a candidate
+/// and, if one was claimed, run its worker turn to completion and resolve the
+/// outcome. This is the inline composition of `dispatch_one` + `run_worker` +
+/// `finalize`; the daemon instead spawns `run_worker` concurrently (ADR-008), but
+/// the whole path stays exercisable without a live daemon here.
+///
+/// `on_activated` fires exactly once, after the claim and advance-to-active both
+/// succeed and before the agent runs.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub async fn run_tick<T, A, R>(
+    tracker: &T,
+    store: &Store,
+    adapter: &A,
+    config: &Config,
+    template_src: &str,
+    repo: &Path,
+    now: u64,
+    holder: &str,
+    on_activated: R,
+) -> TickReport
+where
+    T: Tracker,
+    A: AgentAdapter,
+    R: FnOnce(&Candidate),
+{
+    let dispatch = match dispatch_one(tracker, store, config, now, holder, on_activated) {
+        DispatchOutcome::Dispatched(dispatch) => dispatch,
+        DispatchOutcome::NoDispatch(report) => return report,
+    };
+    let completion = run_worker(tracker, adapter, config, template_src, repo, dispatch).await;
+    TickReport::Dispatched(Box::new(finalize(store, completion)))
 }
 
 /// Decide whether `candidate` has cleared the blocker gate (STORY-061, the
@@ -408,11 +518,12 @@ fn dispatch_gate<T: Tracker>(
 }
 
 /// A post-claim fault before the agent ran (worktree or prompt failure): apply
-/// the failure transition, release the claim, and preserve any worktree.
+/// the failure transition and preserve any worktree. The claim release is
+/// deferred to `finalize` in the orchestrator loop (store single-owner, ADR-008),
+/// signalled by `release_claim: true`.
 #[allow(clippy::too_many_arguments)]
 fn fail_before_agent<T: Tracker>(
     tracker: &T,
-    store: &Store,
     config: &Config,
     candidate: &Candidate,
     claim: &ClaimRecord,
@@ -420,35 +531,37 @@ fn fail_before_agent<T: Tracker>(
     started_at: u64,
     worktree: Option<Worktree>,
     reason: String,
-) -> TickReport {
+) -> WorkerCompletion {
     let outcome = TurnOutcome::Failed { reason };
     let (transition, transition_error) =
         match resolve_outcome(tracker, &candidate.id, &outcome, &config.transitions) {
             Ok(transition) => (Some(transition), None),
             Err(e) => (None, Some(e.to_string())),
         };
-    let claim_released = store.release(&candidate.id).is_ok();
     let (worktree_path, branch) = match worktree {
         Some(w) => (Some(w.path), Some(w.branch)),
         None => (None, None),
     };
 
-    TickReport::Dispatched(Box::new(RunRecord {
-        id: candidate.id.clone(),
-        identifier: candidate.identifier.clone(),
-        title: candidate.title.clone(),
-        holder: claim.holder.clone(),
-        claimed_at_ms: claimed_at,
-        worktree: worktree_path,
-        branch,
-        started_at_ms: started_at,
-        ended_at_ms: now_ms(),
-        events: Vec::new(),
-        outcome,
-        transition,
-        transition_error,
-        claim_released,
-    }))
+    WorkerCompletion {
+        record: RunRecord {
+            id: candidate.id.clone(),
+            identifier: candidate.identifier.clone(),
+            title: candidate.title.clone(),
+            holder: claim.holder.clone(),
+            claimed_at_ms: claimed_at,
+            worktree: worktree_path,
+            branch,
+            started_at_ms: started_at,
+            ended_at_ms: now_ms(),
+            events: Vec::new(),
+            outcome,
+            transition,
+            transition_error,
+            claim_released: false,
+        },
+        release_claim: true,
+    }
 }
 
 /// What a restart's reconcile resolved (STORY-060 AC4, STORY-017).
