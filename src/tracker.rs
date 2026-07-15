@@ -179,12 +179,13 @@ fn parse_and_filter(json: &[u8], mapping: &RoleMapping) -> Result<Vec<Candidate>
     Ok(listing
         .documents
         .into_iter()
+        .filter_map(RawDoc::into_complete)
         .filter(|doc| mapping.classify(&doc.doc_type, &doc.status) == Some(StateRole::Dispatch))
         .map(normalize)
         .collect())
 }
 
-fn normalize(doc: RawDoc) -> Candidate {
+fn normalize(doc: CompleteDoc) -> Candidate {
     let identifier = identifier_from_path(&doc.path, &doc.id);
     let mut parent = None;
     let mut dependencies = Vec::new();
@@ -251,15 +252,42 @@ struct StatusListing {
     documents: Vec<RawDoc>,
 }
 
+/// A listing item as lazyspec emits it, every field optional so a single item
+/// missing a required field is dropped by `into_complete` rather than aborting
+/// the whole parse (STORY-003 AC1).
 #[derive(Deserialize)]
 struct RawDoc {
+    id: Option<String>,
+    path: Option<String>,
+    title: Option<String>,
+    status: Option<String>,
+    #[serde(rename = "type")]
+    doc_type: Option<String>,
+    #[serde(default)]
+    related: Vec<RawRelation>,
+}
+
+impl RawDoc {
+    fn into_complete(self) -> Option<CompleteDoc> {
+        Some(CompleteDoc {
+            id: self.id?,
+            path: self.path?,
+            title: self.title?,
+            status: self.status?,
+            doc_type: self.doc_type?,
+            related: self.related,
+        })
+    }
+}
+
+/// A listing item with every required field present — the only shape `normalize`
+/// will turn into a `Candidate`.
+struct CompleteDoc {
     id: String,
     path: String,
     title: String,
     status: String,
-    #[serde(rename = "type")]
     doc_type: String,
-    #[serde(default)]
     related: Vec<RawRelation>,
 }
 
@@ -401,6 +429,30 @@ mod tests {
 
         let ids: Vec<_> = candidates.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(ids, vec!["ITERATION-006"]);
+    }
+
+    #[test]
+    fn an_item_missing_a_required_field_is_skipped_not_the_whole_listing() {
+        let listing = r#"{
+          "documents": [
+            {"id":"ITERATION-010","path":"docs/iterations/ITERATION-010-a.md",
+             "title":"A","status":"accepted","type":"iteration","related":[]},
+            {"id":"ITERATION-011","path":"docs/iterations/ITERATION-011-b.md",
+             "status":"accepted","type":"iteration","related":[]},
+            {"id":"ITERATION-012","path":"docs/iterations/ITERATION-012-c.md",
+             "title":"C","status":"accepted","type":"iteration","related":[]}
+          ]
+        }"#;
+
+        let candidates =
+            parse_and_filter(listing.as_bytes(), &RoleMapping::adr003_default()).unwrap();
+
+        let ids: Vec<_> = candidates.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["ITERATION-010", "ITERATION-012"],
+            "the item missing `title` must be dropped, not abort the whole listing"
+        );
     }
 
     #[test]

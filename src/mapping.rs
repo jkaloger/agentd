@@ -321,6 +321,26 @@ complete = "terminal"
     }
 
     #[test]
+    fn active_and_terminal_statuses_are_not_dispatch_role() {
+        let mapping = RoleMapping::adr003_default();
+
+        // Only a dispatch-role status may pass the candidate filter; an active
+        // and a terminal status must both be classified as non-dispatch (AC2).
+        assert_ne!(
+            mapping.classify("iteration", "in-progress"),
+            Some(StateRole::Dispatch)
+        );
+        assert_ne!(
+            mapping.classify("iteration", "complete"),
+            Some(StateRole::Dispatch)
+        );
+        assert_eq!(
+            mapping.classify("iteration", "accepted"),
+            Some(StateRole::Dispatch)
+        );
+    }
+
+    #[test]
     fn default_mapping_validates_against_the_iteration_dag() {
         let mapping = RoleMapping::adr003_default();
         assert!(mapping.validate(&StubDag::iteration()).is_ok());

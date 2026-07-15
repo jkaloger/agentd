@@ -1,7 +1,7 @@
 ---
 title: Dispatch only eligible items
 type: iteration
-status: review
+status: complete
 author: Jack Kaloger
 date: 2026-07-14
 tags: []

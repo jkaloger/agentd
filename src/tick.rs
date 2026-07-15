@@ -11,7 +11,7 @@ use crate::prompt::assemble_prompt;
 use crate::resolve::{OutcomeBranch, ResolvedTransition, resolve_outcome};
 use crate::store::{ClaimRecord, Store, StoreError};
 use crate::tracker::{Candidate, DocLookup, Tracker, TrackerError};
-use crate::workspace::{Worktree, WorktreeLister, WorktreeListError, prepare_worktree};
+use crate::workspace::{Worktree, WorktreeListError, WorktreeLister, prepare_worktree};
 
 /// How long a claim's lease is held before it is considered orphaned and
 /// reclaimable by `reconcile`. A single tick finishes well inside this window.
@@ -195,7 +195,13 @@ where
         Ok(candidates) => candidates,
         Err(e) => return TickReport::Error(format!("cannot fetch dispatchable candidates: {e}")),
     };
-    let Some(candidate) = candidates.into_iter().next() else {
+    // Skip any candidate the store already holds a live claim for: it is
+    // already running or claimed, so dispatching it again would double-run it
+    // (STORY-003 AC3). The store is the truth for claims (ADR-002).
+    let Some(candidate) = candidates
+        .into_iter()
+        .find(|c| !has_live_claim(store, &c.id, now))
+    else {
         return TickReport::Idle;
     };
 
@@ -505,6 +511,14 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Whether the store holds a still-live claim for `id` at `now`. A live claim
+/// means the item is already running or claimed and must not be dispatched
+/// again; `claim_and_activate` remains the atomic guard against the race where
+/// a claim appears after this check.
+fn has_live_claim(store: &Store, id: &str, now: u64) -> bool {
+    matches!(store.get(id), Ok(Some(record)) if record.due_at > now)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -649,7 +663,9 @@ mod tests {
     impl WorktreeLister for FakeWorktrees {
         fn list_present(&self) -> Result<BTreeSet<String>, WorktreeListError> {
             if self.fails {
-                return Err(WorktreeListError::Read(io::Error::other("worktree scan failed")));
+                return Err(WorktreeListError::Read(io::Error::other(
+                    "worktree scan failed",
+                )));
             }
             Ok(self.present.clone())
         }
@@ -1119,10 +1135,8 @@ mod tests {
     #[test]
     fn reconcile_drops_a_claim_whose_doc_is_absent() {
         let (_dir, store) = live_claim_store();
-        let tracker = tracker_with_lookups(HashMap::from([(
-            "ITER-014".to_string(),
-            DocLookup::Absent,
-        )]));
+        let tracker =
+            tracker_with_lookups(HashMap::from([("ITER-014".to_string(), DocLookup::Absent)]));
 
         let report = reconcile(
             &store,
@@ -1136,7 +1150,11 @@ mod tests {
         assert_eq!(report.dropped, vec!["ITER-014".to_string()]);
         assert!(report.retained.is_empty());
         assert!(report.released.is_empty());
-        assert_eq!(store.get("ITER-014").unwrap(), None, "claim must be dropped");
+        assert_eq!(
+            store.get("ITER-014").unwrap(),
+            None,
+            "claim must be dropped"
+        );
     }
 
     // STORY-017 AC2: a live-lease claim lazyspec reports terminal-complete is
@@ -1368,9 +1386,10 @@ mod tests {
         );
     }
 
-    // A lost claim (already held) is reported as skipped, not run.
+    // AC3: a candidate the store already holds a live claim for is skipped at
+    // selection and never dispatched again — the existing claim is left intact.
     #[tokio::test]
-    async fn a_lost_claim_is_skipped() {
+    async fn a_candidate_with_a_live_store_claim_is_not_dispatched() {
         let repo = init_repo();
         let store = store(repo.path());
         store
@@ -1392,19 +1411,15 @@ mod tests {
         )
         .await;
 
-        assert!(
-            matches!(
-                report,
-                TickReport::Skipped {
-                    claim: SkipClaim::NotClaimed,
-                    ..
-                }
-            ),
-            "no durable claim was ever committed on a lost claim: {report:?}"
+        assert_eq!(
+            report,
+            TickReport::Idle,
+            "an item with a live claim must not be dispatched again: {report:?}"
         );
         assert_eq!(
             store.get("ITER-014").unwrap().unwrap().holder,
-            "other-agent"
+            "other-agent",
+            "the live claim must be left untouched"
         );
     }
 
