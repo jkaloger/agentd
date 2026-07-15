@@ -26,6 +26,10 @@ pub enum EventKind {
     ReconcileRelease,
     RetryScheduled,
     RetryCleared,
+    /// A dispatch-eligible candidate the blocker gate held back (STORY-061): its
+    /// `blocked-by` dependency or parent is not yet terminal-complete. Recorded so
+    /// the reason is durable and offline-inspectable; no store change backs it.
+    Blocked,
 }
 
 impl fmt::Display for EventKind {
@@ -38,6 +42,7 @@ impl fmt::Display for EventKind {
             EventKind::ReconcileRelease => "reconcile_release",
             EventKind::RetryScheduled => "retry_scheduled",
             EventKind::RetryCleared => "retry_cleared",
+            EventKind::Blocked => "blocked",
         };
         write!(f, "{s}")
     }

@@ -363,6 +363,19 @@ where
                     }
                     SkipClaim::NotClaimed => {}
                 },
+                // The blocker gate held every eligible candidate back (STORY-061
+                // AC1). Nothing was claimed, so there is no store change to mirror;
+                // record each reason to the log so it is durable and inspectable.
+                TickReport::Blocked(blocked) => {
+                    for candidate in blocked {
+                        projection.record(
+                            now,
+                            &candidate.id,
+                            EventKind::Blocked,
+                            &[("reason", &candidate.reason)],
+                        );
+                    }
+                }
                 TickReport::Idle | TickReport::Error(_) => {}
             }
 
@@ -591,6 +604,9 @@ mod tests {
         }
 
         fn lookup_doc(&self, _id: &str) -> Result<DocLookup, TrackerError> {
+            // The blocker gate (STORY-061) looks the candidate's parent up here.
+            // Return the real parent — a story — so terminality is decided by its
+            // actual status, not a fabricated type.
             Ok(DocLookup::Present(self.parent.clone()))
         }
 
@@ -669,6 +685,12 @@ mod tests {
     }
 
     fn fake_tracker() -> FakeTracker {
+        // A terminal parent, so the candidate clears the blocker gate (STORY-061)
+        // and the dispatch-path tests reach the run they exercise.
+        fake_tracker_with_parent_status("complete")
+    }
+
+    fn fake_tracker_with_parent_status(status: &str) -> FakeTracker {
         FakeTracker {
             fetches: Arc::new(AtomicUsize::new(0)),
             candidate: Candidate {
@@ -685,7 +707,7 @@ mod tests {
                 doc_type: "story".to_string(),
                 title: "Execute one iteration end-to-end".to_string(),
                 body: "As an operator, I want one eligible iteration to flow.".to_string(),
-                status: "in-progress".to_string(),
+                status: status.to_string(),
             },
         }
     }
@@ -923,6 +945,50 @@ mod tests {
         let store = Store::open(&store_dir.join("store.redb")).unwrap();
         assert_eq!(store.get("ITER-100").unwrap(), None);
         assert_eq!(store.get("ITER-101").unwrap(), None);
+    }
+
+    // STORY-061 AC1: when the gate holds a candidate back, the daemon records the
+    // blocking reason to the log so it is durable and offline-inspectable — the
+    // reason is not merely computed and discarded. Socket-free, so it runs where
+    // the sandbox blocks bind. The parent story is left non-terminal, so the one
+    // candidate is blocked and never dispatched (the blocking adapter never runs).
+    #[tokio::test]
+    async fn a_blocked_candidate_records_its_reason_to_the_log() {
+        let (_repo, config_path, _socket) = init_project("");
+        let store_dir = config_path.parent().unwrap().to_path_buf();
+        let log_path = store_dir.join("log");
+
+        let (adapter, gate) = blocking_adapter();
+        let tracker = fake_tracker_with_parent_status("in-progress");
+        let mut config = load_str("").unwrap();
+        config.poll_interval_ms = 5;
+        let orch = spawn_orchestrator(&config_path, config, tracker, adapter);
+
+        let mut line = None;
+        for _ in 0..400 {
+            if let Ok(contents) = std::fs::read_to_string(&log_path)
+                && let Some(l) = contents.lines().find(|l| l.contains("event=blocked"))
+            {
+                line = Some(l.to_string());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let line = line.expect("a blocked candidate must record a log line");
+        assert!(line.contains("iter=ITER-014"), "{line}");
+        assert!(
+            line.contains("STORY-060"),
+            "the recorded reason must name the blocking parent: {line}"
+        );
+
+        // Nothing was claimed or run: the store holds no claim for the item.
+        drain_and_shutdown(orch, &gate).await;
+        let store = Store::open(&store_dir.join("store.redb")).unwrap();
+        assert_eq!(
+            store.get("ITER-014").unwrap(),
+            None,
+            "a blocked candidate must never be claimed"
+        );
     }
 
     #[tokio::test]

@@ -51,6 +51,18 @@ impl RoleMapping {
         self.states.get(state).copied()
     }
 
+    /// The orchestration role of a lifecycle `state`, independent of document
+    /// type. Unlike `classify`, this does not require the type to be
+    /// dispatchable: it answers "is this state dispatch/active/terminal?" for any
+    /// document. The blocker gate (STORY-061) needs this because an iteration's
+    /// prerequisites are its parent story/bug and its dependencies — types that
+    /// are not in `dispatch.types` yet share the same lifecycle vocabulary, so
+    /// terminality (`complete`/`rejected`/`superseded`) is a per-state fact that
+    /// holds across types.
+    pub fn role_of_state(&self, state: &str) -> Option<StateRole> {
+        self.states.get(state).copied()
+    }
+
     #[allow(dead_code)]
     pub fn dispatchable_types(&self) -> impl Iterator<Item = &str> {
         self.types.iter().map(String::as_str)
@@ -318,6 +330,24 @@ complete = "terminal"
             mapping.dispatchable_types().collect::<Vec<_>>(),
             vec!["iteration"]
         );
+    }
+
+    // STORY-061: terminality is a per-state fact independent of type. `classify`
+    // returns None for a non-dispatchable type (a story parent), but
+    // `role_of_state` still reports its role, so the blocker gate can decide a
+    // story/bug parent's terminality.
+    #[test]
+    fn role_of_state_is_type_agnostic_where_classify_is_not() {
+        let mapping = RoleMapping::adr003_default();
+
+        assert_eq!(mapping.classify("story", "complete"), None);
+        assert_eq!(mapping.role_of_state("complete"), Some(StateRole::Terminal));
+        assert_eq!(
+            mapping.role_of_state("in-progress"),
+            Some(StateRole::Active)
+        );
+        assert_eq!(mapping.role_of_state("accepted"), Some(StateRole::Dispatch));
+        assert_eq!(mapping.role_of_state("draft"), None);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 ---
 title: Gate dispatch until dependencies and parent are terminal
 type: story
-status: draft
+status: review
 author: Jack Kaloger
 date: 2026-07-13
 tags: []

@@ -10,7 +10,7 @@ use crate::mapping::RoleMapping;
 use crate::prompt::assemble_prompt;
 use crate::resolve::{OutcomeBranch, ResolvedTransition, resolve_outcome};
 use crate::store::{ClaimRecord, Store, StoreError};
-use crate::tracker::{Candidate, DocLookup, Tracker, TrackerError};
+use crate::tracker::{Candidate, DependencyKind, DocLookup, Tracker, TrackerError};
 use crate::workspace::{Worktree, WorktreeListError, WorktreeLister, prepare_worktree};
 
 /// How long a claim's lease is held before it is considered orphaned and
@@ -33,8 +33,30 @@ pub enum TickReport {
         reason: String,
         claim: SkipClaim,
     },
+    /// Candidates were dispatch-eligible by role but every one was held back by
+    /// the blocker gate — a `blocked-by` dependency or the parent work item is
+    /// not yet terminal-complete, or an unresolvable ref (STORY-061). Nothing was
+    /// claimed; the reasons are surfaced so the projection can record them.
+    Blocked(Vec<BlockedCandidate>),
     /// The tick could not fetch candidates.
     Error(String),
+}
+
+/// A candidate the blocker gate held back, with the reason naming the specific
+/// unfinished (or unresolvable) prerequisite (STORY-061 AC1/AC2/AC4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockedCandidate {
+    pub id: String,
+    pub reason: String,
+}
+
+/// Whether a candidate has cleared the blocker gate (STORY-061).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GateStatus {
+    /// Every prerequisite is terminal-complete; the candidate may be dispatched.
+    Eligible,
+    /// A prerequisite is unfinished or unresolvable; the candidate is held.
+    Blocked { reason: String },
 }
 
 /// What durably happened to the store claim behind a `Skipped` tick (STORY-019
@@ -195,14 +217,42 @@ where
         Ok(candidates) => candidates,
         Err(e) => return TickReport::Error(format!("cannot fetch dispatchable candidates: {e}")),
     };
-    // Skip any candidate the store already holds a live claim for: it is
+    // Evaluate candidates in order, dispatching the first that is both free of a
+    // live store claim and past the blocker gate. A live claim means the item is
     // already running or claimed, so dispatching it again would double-run it
-    // (STORY-003 AC3). The store is the truth for claims (ADR-002).
-    let Some(candidate) = candidates
-        .into_iter()
-        .find(|c| !has_live_claim(store, &c.id, now))
-    else {
-        return TickReport::Idle;
+    // (STORY-003 AC3); the store is the truth for claims (ADR-002). The gate holds
+    // an item until its `blocked-by` dependencies and parent are terminal-complete
+    // (STORY-061); a lookup failure is conservative — surface it, never dispatch.
+    let mapping = RoleMapping::from_config(config);
+    let mut blocked = Vec::new();
+    let mut selected = None;
+    for candidate in candidates {
+        if has_live_claim(store, &candidate.id, now) {
+            continue;
+        }
+        match dispatch_gate(tracker, &mapping, &candidate) {
+            Ok(GateStatus::Eligible) => {
+                selected = Some(candidate);
+                break;
+            }
+            Ok(GateStatus::Blocked { reason }) => blocked.push(BlockedCandidate {
+                id: candidate.id,
+                reason,
+            }),
+            Err(e) => {
+                return TickReport::Error(format!(
+                    "cannot evaluate blocker gate for {}: {e}",
+                    candidate.id
+                ));
+            }
+        }
+    }
+    let Some(candidate) = selected else {
+        return if blocked.is_empty() {
+            TickReport::Idle
+        } else {
+            TickReport::Blocked(blocked)
+        };
     };
 
     let claim = match claim_and_activate(
@@ -301,6 +351,56 @@ where
         transition_error,
         claim_released,
     }))
+}
+
+/// Decide whether `candidate` has cleared the blocker gate (STORY-061, the
+/// ADR-003 / SPEC §8.2 rule). The prerequisites are the parent work item plus
+/// every `blocked-by` dependency; the reverse `blocks` edge does not gate here.
+///
+/// For each prerequisite: a `DocLookup::Absent` means the ref cannot be resolved
+/// in lazyspec, so the candidate is blocked and the ref named (AC4); a present
+/// document whose `(type, status)` does not classify as `Terminal` is unfinished,
+/// so the candidate is blocked (AC1/AC2). Only when every prerequisite is
+/// terminal-complete is the candidate `Eligible` (AC3).
+///
+/// A `lookup_doc` failure propagates as `Err` so the caller reports it rather
+/// than dispatching on incomplete knowledge (never silently dispatch).
+fn dispatch_gate<T: Tracker>(
+    tracker: &T,
+    mapping: &RoleMapping,
+    candidate: &Candidate,
+) -> Result<GateStatus, TrackerError> {
+    let prerequisites = candidate.parent.iter().cloned().chain(
+        candidate
+            .dependencies
+            .iter()
+            .filter(|dep| dep.kind == DependencyKind::BlockedBy)
+            .map(|dep| dep.target.clone()),
+    );
+    for prereq in prerequisites {
+        match tracker.lookup_doc(&prereq)? {
+            DocLookup::Absent => {
+                return Ok(GateStatus::Blocked {
+                    reason: format!("prerequisite {prereq} could not be resolved in lazyspec"),
+                });
+            }
+            DocLookup::Present(view) => {
+                // Terminality is a per-state fact across types: an iteration's
+                // parent is a story/bug, not a dispatchable type, so `classify`
+                // (type-aware) would wrongly return None for it. `role_of_state`
+                // reads the shared lifecycle role directly (STORY-061).
+                if mapping.role_of_state(&view.status) != Some(StateRole::Terminal) {
+                    return Ok(GateStatus::Blocked {
+                        reason: format!(
+                            "prerequisite {prereq} is not terminal-complete (status {})",
+                            view.status
+                        ),
+                    });
+                }
+            }
+        }
+    }
+    Ok(GateStatus::Eligible)
 }
 
 /// A post-claim fault before the agent ran (worktree or prompt failure): apply
@@ -531,7 +631,7 @@ mod tests {
 
     use crate::adapter::TurnReport;
     use crate::config::load_str;
-    use crate::tracker::DocView;
+    use crate::tracker::{DependencyRef, DocView};
     use crate::workspace::DiskWorktrees;
 
     const HOLDER: &str = "agentd-1";
@@ -567,6 +667,13 @@ mod tests {
 
         fn advances(&self) -> Arc<Mutex<Vec<(String, String)>>> {
             self.advances.clone()
+        }
+
+        /// Seed the lazyspec state a prerequisite (`blocked-by` dep or parent)
+        /// resolves to when the blocker gate looks it up.
+        fn with_lookup(mut self, id: &str, lookup: DocLookup) -> Self {
+            self.lookups.insert(id.to_string(), lookup);
+            self
         }
     }
 
@@ -769,7 +876,8 @@ mod tests {
     async fn clean_run_flows_to_terminal_and_records_the_full_trace() {
         let repo = init_repo();
         let store = store(repo.path());
-        let tracker = FakeTracker::new(candidate(), parent());
+        let tracker = FakeTracker::new(candidate(), parent())
+            .with_lookup("STORY-060", story_doc("STORY-060", "complete"));
         let advances = tracker.advances();
         let adapter = FakeAdapter::new(completed_report());
         let ran = adapter.ran();
@@ -887,7 +995,8 @@ mod tests {
     async fn failed_run_transitions_failure_releases_claim_and_preserves_worktree() {
         let repo = init_repo();
         let store = store(repo.path());
-        let tracker = FakeTracker::new(candidate(), parent());
+        let tracker = FakeTracker::new(candidate(), parent())
+            .with_lookup("STORY-060", story_doc("STORY-060", "complete"));
         let advances = tracker.advances();
         let adapter = FakeAdapter::new(TurnReport {
             outcome: TurnOutcome::Failed {
@@ -1102,6 +1211,19 @@ mod tests {
         DocLookup::Present(DocView {
             id: id.to_string(),
             doc_type: "iteration".to_string(),
+            title: String::new(),
+            body: String::new(),
+            status: status.to_string(),
+        })
+    }
+
+    /// A parent work item as lazyspec really reports it: a story, not the
+    /// dispatchable `iteration` type. The gate must treat its terminal status as
+    /// terminal even though `story` is not in `dispatch.types` (STORY-061).
+    fn story_doc(id: &str, status: &str) -> DocLookup {
+        DocLookup::Present(DocView {
+            id: id.to_string(),
+            doc_type: "story".to_string(),
             title: String::new(),
             body: String::new(),
             status: status.to_string(),
@@ -1437,7 +1559,7 @@ mod tests {
             advances: Arc::new(Mutex::new(Vec::new())),
             drop_after_claim: false,
             fail_advance: true,
-            lookups: HashMap::new(),
+            lookups: HashMap::from([("STORY-060".to_string(), story_doc("STORY-060", "complete"))]),
             lookup_fails: false,
         };
         let adapter = FakeAdapter::new(completed_report());
@@ -1469,6 +1591,196 @@ mod tests {
             store.get("ITER-014").unwrap(),
             None,
             "the claim must have been durably released"
+        );
+    }
+
+    /// A dispatch-role candidate (`ITER-014`) with a chosen parent link and
+    /// dependency set, for exercising the blocker gate. Its parent DocView (for
+    /// prompt assembly) is still `parent()`; the gate reads prerequisites via the
+    /// tracker's `lookups` map.
+    fn candidate_with(parent: Option<&str>, dependencies: Vec<DependencyRef>) -> Candidate {
+        Candidate {
+            id: "ITER-014".to_string(),
+            identifier: "gated".to_string(),
+            title: "Execute one iteration end-to-end".to_string(),
+            body: "Objective: prove the gate.".to_string(),
+            state: "accepted".to_string(),
+            parent: parent.map(|p| p.to_string()),
+            dependencies,
+        }
+    }
+
+    fn blocked_by(target: &str) -> DependencyRef {
+        DependencyRef {
+            target: target.to_string(),
+            kind: DependencyKind::BlockedBy,
+        }
+    }
+
+    async fn tick(store: &Store, tracker: &FakeTracker, repo: &Path) -> TickReport {
+        let adapter = FakeAdapter::new(completed_report());
+        run_tick(
+            tracker,
+            store,
+            &adapter,
+            &config(),
+            crate::prompt::DEFAULT_TEMPLATE,
+            repo,
+            NOW,
+            HOLDER,
+            |_| {},
+        )
+        .await
+    }
+
+    // STORY-061 AC1: a candidate with a `blocked-by` dependency that is not
+    // terminal is held back, not dispatched, and the reason names the dependency.
+    #[tokio::test]
+    async fn a_non_terminal_dependency_blocks_dispatch_with_a_reason() {
+        let repo = init_repo();
+        let store = store(repo.path());
+        let tracker =
+            FakeTracker::new(candidate_with(None, vec![blocked_by("ITER-050")]), parent())
+                .with_lookup("ITER-050", iteration_doc("ITER-050", "in-progress"));
+
+        let report = tick(&store, &tracker, repo.path()).await;
+
+        let blocked = match report {
+            TickReport::Blocked(blocked) => blocked,
+            other => panic!("expected Blocked, got {other:?}"),
+        };
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0].id, "ITER-014");
+        assert!(
+            blocked[0].reason.contains("ITER-050"),
+            "reason must name the blocking dependency: {}",
+            blocked[0].reason
+        );
+        assert_eq!(
+            store.get("ITER-014").unwrap(),
+            None,
+            "a blocked candidate must never be claimed"
+        );
+    }
+
+    // STORY-061 AC2: a candidate whose parent work item is not terminal-complete
+    // is held back as blocked.
+    #[tokio::test]
+    async fn a_non_terminal_parent_blocks_dispatch() {
+        let repo = init_repo();
+        let store = store(repo.path());
+        let tracker = FakeTracker::new(candidate_with(Some("STORY-060"), Vec::new()), parent())
+            .with_lookup("STORY-060", story_doc("STORY-060", "in-progress"));
+
+        let report = tick(&store, &tracker, repo.path()).await;
+
+        let blocked = match report {
+            TickReport::Blocked(blocked) => blocked,
+            other => panic!("expected Blocked, got {other:?}"),
+        };
+        assert!(
+            blocked[0].reason.contains("STORY-060"),
+            "reason must name the blocking parent: {}",
+            blocked[0].reason
+        );
+        assert_eq!(store.get("ITER-014").unwrap(), None);
+    }
+
+    // STORY-061 AC3: when every `blocked-by` dependency and the parent are
+    // terminal-complete, the candidate becomes dispatch-eligible and is claimed.
+    #[tokio::test]
+    async fn all_prerequisites_terminal_dispatches_the_candidate() {
+        let repo = init_repo();
+        let store = store(repo.path());
+        let tracker = FakeTracker::new(
+            candidate_with(Some("STORY-060"), vec![blocked_by("ITER-050")]),
+            parent(),
+        )
+        .with_lookup("STORY-060", story_doc("STORY-060", "complete"))
+        .with_lookup("ITER-050", iteration_doc("ITER-050", "complete"));
+
+        let report = tick(&store, &tracker, repo.path()).await;
+
+        assert!(
+            matches!(report, TickReport::Dispatched(_)),
+            "all prerequisites terminal must dispatch: {report:?}"
+        );
+        assert_eq!(
+            store.get("ITER-014").unwrap().unwrap().holder,
+            HOLDER,
+            "a dispatched candidate must hold the claim"
+        );
+    }
+
+    // STORY-061 AC4: a dependency reference lazyspec cannot resolve is treated as
+    // blocked, not silently dispatched, and the unresolved ref is surfaced.
+    #[tokio::test]
+    async fn an_unresolvable_dependency_blocks_and_surfaces_the_ref() {
+        let repo = init_repo();
+        let store = store(repo.path());
+        let tracker =
+            FakeTracker::new(candidate_with(None, vec![blocked_by("ITER-999")]), parent())
+                .with_lookup("ITER-999", DocLookup::Absent);
+
+        let report = tick(&store, &tracker, repo.path()).await;
+
+        let blocked = match report {
+            TickReport::Blocked(blocked) => blocked,
+            other => panic!("expected Blocked, got {other:?}"),
+        };
+        assert!(
+            blocked[0].reason.contains("ITER-999"),
+            "an unresolved ref must be surfaced: {}",
+            blocked[0].reason
+        );
+        assert_eq!(
+            store.get("ITER-014").unwrap(),
+            None,
+            "an unresolvable prerequisite must never be dispatched"
+        );
+    }
+
+    // A `lookup_doc` failure while gating is conservative: it surfaces as
+    // TickReport::Error, never a dispatch (STORY-061 — never silently dispatch).
+    #[tokio::test]
+    async fn a_gate_lookup_failure_is_an_error_not_a_dispatch() {
+        let repo = init_repo();
+        let store = store(repo.path());
+        let mut tracker = FakeTracker::new(candidate_with(Some("STORY-060"), Vec::new()), parent());
+        tracker.lookup_fails = true;
+
+        let report = tick(&store, &tracker, repo.path()).await;
+
+        assert!(
+            matches!(report, TickReport::Error(_)),
+            "a gate lookup failure must surface as an error: {report:?}"
+        );
+        assert_eq!(
+            store.get("ITER-014").unwrap(),
+            None,
+            "a lookup failure must never dispatch"
+        );
+    }
+
+    // Out of scope guard: the reverse `blocks` edge does not gate dispatch. A
+    // non-terminal `blocks` dependency, with the parent terminal, still dispatches.
+    #[tokio::test]
+    async fn a_blocks_edge_does_not_gate_dispatch() {
+        let repo = init_repo();
+        let store = store(repo.path());
+        let blocks = DependencyRef {
+            target: "ITER-051".to_string(),
+            kind: DependencyKind::Blocks,
+        };
+        let tracker = FakeTracker::new(candidate_with(Some("STORY-060"), vec![blocks]), parent())
+            .with_lookup("STORY-060", story_doc("STORY-060", "complete"))
+            .with_lookup("ITER-051", iteration_doc("ITER-051", "in-progress"));
+
+        let report = tick(&store, &tracker, repo.path()).await;
+
+        assert!(
+            matches!(report, TickReport::Dispatched(_)),
+            "a `blocks` edge must not gate dispatch: {report:?}"
         );
     }
 }
