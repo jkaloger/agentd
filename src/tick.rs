@@ -213,10 +213,14 @@ where
     A: AgentAdapter,
     R: FnOnce(&Candidate),
 {
-    let candidates = match tracker.fetch_dispatchable() {
+    let mut candidates = match tracker.fetch_dispatchable() {
         Ok(candidates) => candidates,
         Err(e) => return TickReport::Error(format!("cannot fetch dispatchable candidates: {e}")),
     };
+    // Order the eligible set so the highest-priority item is offered first when
+    // slots are scarce (STORY-004); selection below still takes the first that
+    // clears the live-claim check and the blocker gate.
+    candidates.sort_by(dispatch_order);
     // Evaluate candidates in order, dispatching the first that is both free of a
     // live store claim and past the blocker gate. A live claim means the item is
     // already running or claimed, so dispatching it again would double-run it
@@ -604,6 +608,23 @@ pub fn reconcile<T: Tracker, W: WorktreeLister>(
     })
 }
 
+/// Dispatch ordering (STORY-004, ADR-007 / SPEC §8.2): a lower priority number
+/// is more urgent and sorts first (AC1); ties fall to the oldest `created_at`,
+/// then the `identifier` lexicographically for a deterministic total order (AC2);
+/// a `None` priority sorts after every defined priority, however large (AC3).
+fn dispatch_order(a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let by_priority = match (a.priority, b.priority) {
+        (Some(x), Some(y)) => x.cmp(&y),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    };
+    by_priority
+        .then_with(|| a.created_at.cmp(&b.created_at))
+        .then_with(|| a.identifier.cmp(&b.identifier))
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -837,6 +858,8 @@ mod tests {
             state: "accepted".to_string(),
             parent: Some("STORY-060".to_string()),
             dependencies: Vec::new(),
+            priority: None,
+            created_at: "2026-07-13".to_string(),
         }
     }
 
@@ -1607,7 +1630,90 @@ mod tests {
             state: "accepted".to_string(),
             parent: parent.map(|p| p.to_string()),
             dependencies,
+            priority: None,
+            created_at: "2026-07-13".to_string(),
         }
+    }
+
+    /// A minimal candidate carrying only the fields `dispatch_order` reads, for
+    /// exercising the ordering directly over a constructed set (STORY-004).
+    fn ranked(identifier: &str, priority: Option<u32>, created_at: &str) -> Candidate {
+        Candidate {
+            id: identifier.to_string(),
+            identifier: identifier.to_string(),
+            title: String::new(),
+            body: String::new(),
+            state: "accepted".to_string(),
+            parent: None,
+            dependencies: Vec::new(),
+            priority,
+            created_at: created_at.to_string(),
+        }
+    }
+
+    fn order(mut candidates: Vec<Candidate>) -> Vec<String> {
+        candidates.sort_by(dispatch_order);
+        candidates.into_iter().map(|c| c.identifier).collect()
+    }
+
+    // STORY-004 AC1: with mixed priorities, the lowest priority number dispatches
+    // first.
+    #[test]
+    fn lowest_priority_number_sorts_first() {
+        let ordered = order(vec![
+            ranked("c", Some(5), "2026-07-13"),
+            ranked("a", Some(1), "2026-07-13"),
+            ranked("b", Some(3), "2026-07-13"),
+        ]);
+
+        assert_eq!(ordered, vec!["a", "b", "c"]);
+    }
+
+    // STORY-004 AC2: equal priority breaks to the oldest created_at, then the
+    // identifier lexicographically when created_at is also equal.
+    #[test]
+    fn equal_priority_breaks_by_age_then_identifier() {
+        let ordered = order(vec![
+            ranked("z", Some(2), "2026-07-13"),
+            ranked("a", Some(2), "2026-07-13"),
+            ranked("older", Some(2), "2026-07-10"),
+        ]);
+
+        assert_eq!(
+            ordered,
+            vec!["older", "a", "z"],
+            "oldest first, then identifier for the created_at tie"
+        );
+    }
+
+    // STORY-004 AC3: a None priority sorts after every defined priority, even a
+    // large one.
+    #[test]
+    fn missing_priority_sorts_after_all_defined() {
+        let ordered = order(vec![
+            ranked("none", None, "2020-01-01"),
+            ranked("big", Some(9999), "2026-07-13"),
+            ranked("small", Some(1), "2026-07-13"),
+        ]);
+
+        assert_eq!(
+            ordered,
+            vec!["small", "big", "none"],
+            "an older, unprioritised item must still sort after a large defined priority"
+        );
+    }
+
+    // STORY-004: two unprioritised candidates still order deterministically by
+    // age then identifier.
+    #[test]
+    fn two_missing_priorities_fall_through_to_age_and_identifier() {
+        let ordered = order(vec![
+            ranked("b", None, "2026-07-13"),
+            ranked("a", None, "2026-07-13"),
+            ranked("older", None, "2026-07-01"),
+        ]);
+
+        assert_eq!(ordered, vec!["older", "a", "b"]);
     }
 
     fn blocked_by(target: &str) -> DependencyRef {

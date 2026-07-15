@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -20,6 +21,12 @@ pub struct Candidate {
     pub state: String,
     pub parent: Option<String>,
     pub dependencies: Vec<DependencyRef>,
+    /// Dispatch priority from the tracker's `attributes` map; a lower number is
+    /// more urgent. `None` when the doc publishes no priority — ordered last.
+    pub priority: Option<u32>,
+    /// The document's creation date (lazyspec's `date` field), the age tie-break
+    /// when two candidates share a priority (STORY-004 AC2).
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -203,6 +210,11 @@ fn normalize(doc: CompleteDoc) -> Candidate {
             _ => {}
         }
     }
+    let priority = doc
+        .attributes
+        .get("priority")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32);
     Candidate {
         id: doc.id,
         identifier,
@@ -211,6 +223,8 @@ fn normalize(doc: CompleteDoc) -> Candidate {
         state: doc.status,
         parent,
         dependencies,
+        priority,
+        created_at: doc.date,
     }
 }
 
@@ -265,6 +279,10 @@ struct RawDoc {
     doc_type: Option<String>,
     #[serde(default)]
     related: Vec<RawRelation>,
+    #[serde(default)]
+    attributes: HashMap<String, serde_json::Value>,
+    #[serde(default)]
+    date: String,
 }
 
 impl RawDoc {
@@ -276,6 +294,8 @@ impl RawDoc {
             status: self.status?,
             doc_type: self.doc_type?,
             related: self.related,
+            attributes: self.attributes,
+            date: self.date,
         })
     }
 }
@@ -289,6 +309,8 @@ struct CompleteDoc {
     status: String,
     doc_type: String,
     related: Vec<RawRelation>,
+    attributes: HashMap<String, serde_json::Value>,
+    date: String,
 }
 
 #[derive(Deserialize)]
@@ -500,6 +522,31 @@ mod tests {
     }
 
     #[test]
+    fn priority_and_created_at_are_parsed_from_attributes_and_date() {
+        let listing = r#"{
+          "documents": [
+            {"id":"ITERATION-020","path":"docs/iterations/ITERATION-020-a.md",
+             "title":"With priority","status":"accepted","type":"iteration","related":[],
+             "attributes":{"priority":3},"date":"2026-07-10"},
+            {"id":"ITERATION-021","path":"docs/iterations/ITERATION-021-b.md",
+             "title":"No priority","status":"accepted","type":"iteration","related":[],
+             "attributes":{},"date":"2026-07-11"}
+          ]
+        }"#;
+
+        let candidates =
+            parse_and_filter(listing.as_bytes(), &RoleMapping::adr003_default()).unwrap();
+
+        assert_eq!(candidates[0].priority, Some(3));
+        assert_eq!(candidates[0].created_at, "2026-07-10");
+        assert_eq!(
+            candidates[1].priority, None,
+            "an empty attributes map yields no priority"
+        );
+        assert_eq!(candidates[1].created_at, "2026-07-11");
+    }
+
+    #[test]
     fn fetch_doc_parses_type_title_and_body_for_a_parent() {
         let tracker = LazyspecTracker::new(
             FakeCli::ok(r#"{"documents":[]}"#).with_body(
@@ -680,6 +727,7 @@ mod tests {
                 assert!(!c.id.is_empty(), "{c:?}");
                 assert!(!c.identifier.is_empty(), "{c:?}");
                 assert_eq!(c.state, "accepted", "{c:?}");
+                assert!(!c.created_at.is_empty(), "{c:?}");
             }
         }
     }

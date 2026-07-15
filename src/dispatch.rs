@@ -156,6 +156,8 @@ mod tests {
             state: "accepted".to_string(),
             parent: None,
             dependencies: Vec::new(),
+            priority: None,
+            created_at: "2026-07-13".to_string(),
         }
     }
 

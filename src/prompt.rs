@@ -145,6 +145,8 @@ mod tests {
             state: "accepted".to_string(),
             parent: Some("STORY-028".to_string()),
             dependencies: Vec::new(),
+            priority: None,
+            created_at: "2026-07-13".to_string(),
         }
     }
 
