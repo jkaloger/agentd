@@ -207,11 +207,14 @@ pub enum DispatchOutcome {
 }
 
 /// A claimed candidate handed from the dispatch step to a spawned worker: the
-/// candidate, its committed claim, and when it was claimed.
+/// candidate, its committed claim, when it was claimed, and which attempt this
+/// run is — one for a fresh dispatch, the retry's own number when a fired retry
+/// re-dispatches it (STORY-009).
 pub struct Dispatch {
     pub candidate: Candidate,
     pub claim: ClaimRecord,
     pub claimed_at_ms: u64,
+    pub attempt: u32,
 }
 
 /// A finished worker turn resolved into a `RunRecord`, with the claim not yet
@@ -344,6 +347,7 @@ where
         candidate,
         claim,
         claimed_at_ms: now,
+        attempt: FIRST_ATTEMPT,
     })
 }
 
@@ -376,6 +380,7 @@ where
         candidate,
         claim,
         claimed_at_ms,
+        attempt,
     } = dispatch;
 
     let root = repo.join(&config.workspace.root);
@@ -397,7 +402,7 @@ where
         }
     };
 
-    let prompt = match assemble_prompt(template_src, &candidate, FIRST_ATTEMPT, tracker) {
+    let prompt = match assemble_prompt(template_src, &candidate, attempt, tracker) {
         Ok(prompt) => prompt,
         Err(e) => {
             return fail_before_agent(
@@ -497,6 +502,135 @@ where
     };
     let completion = run_worker(tracker, adapter, config, template_src, repo, dispatch).await;
     TickReport::Dispatched(Box::new(finalize(store, completion)))
+}
+
+/// What one fired retry resolved to (STORY-009).
+#[derive(Debug)]
+#[allow(dead_code)]
+pub enum RetryFire {
+    /// lazyspec no longer offers the item, so the work is stale or gone: its
+    /// claim was released and its retry schedule cleared (AC1).
+    Released(String),
+    /// The item was re-dispatched carrying its own attempt number — not attempt
+    /// one — and its retry schedule cleared once re-dispatched (AC2).
+    Redispatched(String),
+    /// The item is still eligible but every orchestrator slot is taken: the retry
+    /// was rescheduled with the slot error, preserving its attempt (AC3).
+    Requeued(String),
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
+pub enum RetryFireError {
+    Store(StoreError),
+    Tracker(TrackerError),
+}
+
+impl std::fmt::Display for RetryFireError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RetryFireError::Store(e) => write!(f, "retry-fire store error: {e:?}"),
+            RetryFireError::Tracker(e) => write!(f, "retry-fire tracker error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for RetryFireError {}
+
+/// Resolve every retry whose timer has fired (STORY-009). Each due retry
+/// (`store.due_retries`) is decided against a fresh candidate re-fetch taken
+/// *before* any store mutation, so a stale or completed item is never relaunched:
+///
+/// - the re-fetch fails → the schedule is left intact and the error returned so
+///   the next cycle retries — never released on a read we could not complete (AC4),
+///   mirroring `reconcile`'s conservative read-fails-first ordering;
+/// - the item is absent from the candidates → its claim is released and its retry
+///   schedule cleared (AC1);
+/// - the item is present with a free slot (`in_flight` below `config.max_concurrent`)
+///   → it is re-dispatched through the normal claim/worktree/prompt path carrying
+///   `RetryRecord.attempt`, and its retry cleared once re-dispatched (AC2);
+/// - the item is present but every slot is taken → its retry is rescheduled with
+///   the error "no available orchestrator slots", preserving the attempt (AC3).
+///
+/// This is the inline composition (claim -> worktree -> turn -> finalize) that
+/// mirrors `run_tick`; the daemon wires it into its poll loop with concurrent
+/// workers and live-slot accounting in a later iteration.
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+pub async fn fire_due_retries<T, A>(
+    tracker: &T,
+    store: &Store,
+    adapter: &A,
+    config: &Config,
+    template_src: &str,
+    repo: &Path,
+    now: u64,
+    holder: &str,
+    in_flight: usize,
+) -> Result<Vec<RetryFire>, RetryFireError>
+where
+    T: Tracker,
+    A: AgentAdapter,
+{
+    let due = store.due_retries(now).map_err(RetryFireError::Store)?;
+    let mut occupied = in_flight;
+    let mut outcomes = Vec::new();
+    for (id, record) in due {
+        let candidate = tracker
+            .fetch_dispatchable()
+            .map_err(RetryFireError::Tracker)?
+            .into_iter()
+            .find(|c| c.id == id);
+
+        let Some(candidate) = candidate else {
+            store.release(&id).map_err(RetryFireError::Store)?;
+            store.clear_retry(&id).map_err(RetryFireError::Store)?;
+            outcomes.push(RetryFire::Released(id));
+            continue;
+        };
+
+        if occupied >= config.max_concurrent as usize {
+            store
+                .schedule_retry(
+                    &id,
+                    record.attempt,
+                    "no available orchestrator slots",
+                    record.due_at,
+                )
+                .map_err(RetryFireError::Store)?;
+            outcomes.push(RetryFire::Requeued(id));
+            continue;
+        }
+
+        let claim = match claim_and_activate(
+            tracker,
+            store,
+            &candidate,
+            holder,
+            now,
+            DEFAULT_LEASE_TTL,
+            &config.transitions.claim,
+            || {},
+        ) {
+            Ok(claim) => claim,
+            // Claim lost to another holder or the advance was gated out: leave the
+            // retry scheduled so the next cycle re-evaluates it.
+            Err(_) => continue,
+        };
+        occupied += 1;
+
+        let dispatch = Dispatch {
+            candidate,
+            claim,
+            claimed_at_ms: now,
+            attempt: record.attempt,
+        };
+        let completion = run_worker(tracker, adapter, config, template_src, repo, dispatch).await;
+        finalize(store, completion);
+        store.clear_retry(&id).map_err(RetryFireError::Store)?;
+        outcomes.push(RetryFire::Redispatched(id));
+    }
+    Ok(outcomes)
 }
 
 /// Decide whether `candidate` has cleared the blocker gate (STORY-061, the
@@ -816,6 +950,7 @@ mod tests {
         fail_advance: bool,
         lookups: HashMap<String, DocLookup>,
         lookup_fails: bool,
+        fetch_fails: bool,
     }
 
     impl FakeTracker {
@@ -828,6 +963,7 @@ mod tests {
                 fail_advance: false,
                 lookups: HashMap::new(),
                 lookup_fails: false,
+                fetch_fails: false,
             }
         }
 
@@ -845,6 +981,12 @@ mod tests {
 
     impl Tracker for FakeTracker {
         fn fetch_dispatchable(&self) -> Result<Vec<Candidate>, TrackerError> {
+            if self.fetch_fails {
+                return Err(TrackerError::Command {
+                    code: Some(1),
+                    stderr: "lazyspec status unreadable".to_string(),
+                });
+            }
             Ok(self.candidate.lock().unwrap().clone().into_iter().collect())
         }
 
@@ -1229,6 +1371,7 @@ mod tests {
             fail_advance: false,
             lookups: HashMap::new(),
             lookup_fails: false,
+            fetch_fails: false,
         };
         let adapter = FakeAdapter::new(completed_report());
 
@@ -1279,6 +1422,7 @@ mod tests {
             fail_advance: false,
             lookups: HashMap::new(),
             lookup_fails: false,
+            fetch_fails: false,
         };
 
         let after_expiry = NOW + DEFAULT_LEASE_TTL.as_millis() as u64 + 1;
@@ -1329,6 +1473,7 @@ mod tests {
             fail_advance: false,
             lookups: HashMap::new(),
             lookup_fails: false,
+            fetch_fails: false,
         };
 
         let after_expiry = NOW + DEFAULT_LEASE_TTL.as_millis() as u64 + 1;
@@ -1408,6 +1553,7 @@ mod tests {
             fail_advance: false,
             lookups,
             lookup_fails: false,
+            fetch_fails: false,
         }
     }
 
@@ -1526,6 +1672,7 @@ mod tests {
             fail_advance: false,
             lookups: HashMap::new(),
             lookup_fails: true,
+            fetch_fails: false,
         };
 
         let result = reconcile(
@@ -1729,6 +1876,7 @@ mod tests {
             fail_advance: true,
             lookups: HashMap::from([("STORY-060".to_string(), story_doc("STORY-060", "complete"))]),
             lookup_fails: false,
+            fetch_fails: false,
         };
         let adapter = FakeAdapter::new(completed_report());
 
@@ -2032,6 +2180,188 @@ mod tests {
         assert!(
             matches!(report, TickReport::Dispatched(_)),
             "a `blocks` edge must not gate dispatch: {report:?}"
+        );
+    }
+
+    // STORY-009 AC1: a fired retry whose item lazyspec no longer offers releases
+    // the claim and clears the retry schedule — the work is stale or gone.
+    #[tokio::test]
+    async fn retry_fire_releases_and_clears_when_the_item_is_absent() {
+        let repo = init_repo();
+        let store = store(repo.path());
+        store
+            .claim("ITER-014", HOLDER, NOW, DEFAULT_LEASE_TTL)
+            .unwrap();
+        store.schedule_retry("ITER-014", 2, "boom", NOW).unwrap();
+        // The tracker offers nothing, so the item is absent from candidates.
+        let tracker = tracker_with_lookups(HashMap::new());
+        let adapter = FakeAdapter::new(completed_report());
+
+        let outcomes = fire_due_retries(
+            &tracker,
+            &store,
+            &adapter,
+            &config(),
+            crate::prompt::DEFAULT_TEMPLATE,
+            repo.path(),
+            NOW,
+            HOLDER,
+            0,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(outcomes.as_slice(), [RetryFire::Released(id)] if id == "ITER-014"),
+            "{outcomes:?}"
+        );
+        assert_eq!(
+            store.get("ITER-014").unwrap(),
+            None,
+            "an absent item's claim must be released"
+        );
+        assert!(
+            store.due_retries(NOW).unwrap().is_empty(),
+            "the retry schedule must be cleared"
+        );
+    }
+
+    // STORY-009 AC2 + Verification: a fired retry that is still offered and has a
+    // free slot is re-dispatched carrying its own attempt number — the prompt
+    // shows attempt 2, not attempt 1 — and its retry schedule is cleared.
+    #[tokio::test]
+    async fn retry_fire_redispatches_carrying_the_attempt_when_a_slot_is_free() {
+        let repo = init_repo();
+        let store = store(repo.path());
+        store
+            .schedule_retry("ITER-014", 2, "agent exited", NOW)
+            .unwrap();
+        let tracker = FakeTracker::new(candidate(), parent());
+        let adapter = FakeAdapter::new(completed_report());
+        let ran = adapter.ran();
+
+        let outcomes = fire_due_retries(
+            &tracker,
+            &store,
+            &adapter,
+            &config(),
+            crate::prompt::DEFAULT_TEMPLATE,
+            repo.path(),
+            NOW,
+            HOLDER,
+            0,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(outcomes.as_slice(), [RetryFire::Redispatched(id)] if id == "ITER-014"),
+            "{outcomes:?}"
+        );
+        let (_, prompt) = ran.lock().unwrap().clone().expect("the retry must run a turn");
+        assert!(
+            prompt.contains("Retry (attempt 2)"),
+            "the prompt must carry the retry's own attempt, not attempt 1: {prompt}"
+        );
+        assert!(
+            store.due_retries(NOW).unwrap().is_empty(),
+            "the retry must be cleared once re-dispatched"
+        );
+        assert_eq!(
+            store.get("ITER-014").unwrap().unwrap().holder,
+            HOLDER,
+            "the re-dispatch must hold the claim"
+        );
+    }
+
+    // STORY-009 AC3: a fired retry that is still eligible but has no free slot is
+    // rescheduled with the slot error, preserving its attempt, and is not claimed.
+    #[tokio::test]
+    async fn retry_fire_requeues_with_the_slot_error_when_no_slot_is_free() {
+        let repo = init_repo();
+        let store = store(repo.path());
+        store
+            .schedule_retry("ITER-014", 3, "agent exited", 5_000)
+            .unwrap();
+        let tracker = FakeTracker::new(candidate(), parent());
+        let adapter = FakeAdapter::new(completed_report());
+        let config = config();
+
+        let outcomes = fire_due_retries(
+            &tracker,
+            &store,
+            &adapter,
+            &config,
+            crate::prompt::DEFAULT_TEMPLATE,
+            repo.path(),
+            NOW,
+            HOLDER,
+            config.max_concurrent as usize,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(outcomes.as_slice(), [RetryFire::Requeued(id)] if id == "ITER-014"),
+            "{outcomes:?}"
+        );
+        let retries = store.retries().unwrap();
+        assert_eq!(retries.len(), 1);
+        let (id, record) = &retries[0];
+        assert_eq!(id, "ITER-014");
+        assert_eq!(record.error, "no available orchestrator slots");
+        assert_eq!(record.attempt, 3, "the attempt must be preserved");
+        assert_eq!(record.due_at, 5_000, "the schedule's due_at must be preserved");
+        assert_eq!(
+            store.get("ITER-014").unwrap(),
+            None,
+            "no slot means the item must not be claimed"
+        );
+    }
+
+    // STORY-009 AC4 + Verification: when the candidate re-fetch fails, the retry
+    // is requeued — the schedule is byte-for-byte untouched and the claim intact —
+    // and the error surfaces so the next cycle retries rather than releasing.
+    #[tokio::test]
+    async fn retry_fire_leaves_the_schedule_untouched_when_the_refetch_fails() {
+        let repo = init_repo();
+        let store = store(repo.path());
+        store
+            .claim("ITER-014", HOLDER, NOW, DEFAULT_LEASE_TTL)
+            .unwrap();
+        let before = store
+            .schedule_retry("ITER-014", 4, "agent exited", 5_000)
+            .unwrap();
+        let mut tracker = FakeTracker::new(candidate(), parent());
+        tracker.fetch_fails = true;
+        let adapter = FakeAdapter::new(completed_report());
+
+        let result = fire_due_retries(
+            &tracker,
+            &store,
+            &adapter,
+            &config(),
+            crate::prompt::DEFAULT_TEMPLATE,
+            repo.path(),
+            NOW,
+            HOLDER,
+            0,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(RetryFireError::Tracker(_))),
+            "a re-fetch failure must surface so the next cycle retries: {result:?}"
+        );
+        assert_eq!(
+            store.retries().unwrap().as_slice(),
+            &[("ITER-014".to_string(), before)],
+            "the retry schedule must be byte-for-byte untouched"
+        );
+        assert_eq!(
+            store.get("ITER-014").unwrap().unwrap().holder,
+            HOLDER,
+            "the claim must be untouched"
         );
     }
 }
