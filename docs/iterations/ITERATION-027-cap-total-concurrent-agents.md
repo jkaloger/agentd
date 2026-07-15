@@ -1,13 +1,15 @@
 ---
 title: Cap total concurrent agents
 type: iteration
-status: review
+status: superseded
 author: Jack Kaloger
 date: 2026-07-14
 tags: []
 related:
 - implements: STORY-005
 ---
+
+> **Superseded by [[ITERATION-037]].** The concurrent-worker substrate ([[ADR-008]] / STORY-069) delivered this global cap directly: the daemon fill loop dispatches up to `max_concurrent` minus the live-worker count per tick, breaks at zero slots, and resumes when a worker frees a slot (`a_full_pool_defers_the_third_until_a_worker_frees_a_slot`). STORY-005's three ACs are met there. This iteration's original plan — counting live `store.claims()` — became incorrect once completed items retain their claim, since it would count retained (non-running) claims against the ceiling; the in-memory worker registry is the correct running-count source. Retained for provenance only.
 
 ## Objective
 Gate dispatch on a hard global ceiling: with `max_concurrent=N` and N already running, available slots is 0 so nothing dispatches; a freed slot lets the next tick resume; the dispatch loop breaks the instant slots hit zero and leaves the rest for a future tick.

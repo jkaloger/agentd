@@ -7,6 +7,7 @@ date: 2026-07-15
 tags: []
 related:
 - implements: STORY-069
+- supersedes: ITERATION-027
 ---
 
 ## Objective
