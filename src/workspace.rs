@@ -68,6 +68,33 @@ impl std::error::Error for WorktreeListError {
     }
 }
 
+#[derive(Debug)]
+pub enum WorktreeRemoveError {
+    Spawn(io::Error),
+    Git { code: Option<i32>, stderr: String },
+}
+
+impl fmt::Display for WorktreeRemoveError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WorktreeRemoveError::Spawn(e) => write!(f, "cannot run git worktree remove: {e}"),
+            WorktreeRemoveError::Git { code, stderr } => match code {
+                Some(c) => write!(f, "git worktree remove failed ({c}): {stderr}"),
+                None => write!(f, "git worktree remove terminated: {stderr}"),
+            },
+        }
+    }
+}
+
+impl std::error::Error for WorktreeRemoveError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            WorktreeRemoveError::Spawn(e) => Some(e),
+            WorktreeRemoveError::Git { .. } => None,
+        }
+    }
+}
+
 /// The worktrees reconcile finds on disk, so it can cross-check the store against
 /// the trees that actually exist (ADR-002). Injected like the tracker so reconcile
 /// tests can supply a present/absent/failing listing without touching git.
@@ -179,6 +206,29 @@ fn clean_up_partial(repo: &Path, path: &Path, target_existed: bool) {
         .arg(repo)
         .args(["worktree", "prune"])
         .output();
+}
+
+/// Remove the worktree at `path` from `repo` (`git worktree remove --force`),
+/// the terminal-item cleanup of ADR-005 (SPEC §8.6). `--force` because an
+/// interrupted run's tree may hold uncommitted or untracked changes git would
+/// otherwise refuse to discard. Returns a distinct error the caller can log; a
+/// failure here is non-fatal to the caller — the claim is released regardless.
+pub fn remove_worktree(repo: &Path, path: &Path) -> Result<(), WorktreeRemoveError> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["worktree", "remove", "--force"])
+        .arg(path)
+        .output()
+        .map_err(WorktreeRemoveError::Spawn)?;
+
+    if !output.status.success() {
+        return Err(WorktreeRemoveError::Git {
+            code: output.status.code(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// Lexically resolve `<root>/<iter_id>` and confirm it stays strictly under
@@ -344,6 +394,56 @@ mod tests {
         let root = repo.path().join(".agentd/workspaces");
 
         assert!(list_worktrees(&root).unwrap().is_empty());
+    }
+
+    // STORY-010 AC1: the terminal-item cleanup removes the worktree directory and
+    // unregisters it from git so a later prepare of the same id starts clean.
+    #[test]
+    fn remove_worktree_deletes_the_tree_and_unregisters_it() {
+        let repo = init_repo();
+        let root = repo.path().join(".agentd/workspaces");
+        let wt = prepare_worktree(repo.path(), &root, "ITER-300", None).unwrap();
+        assert!(wt.path.is_dir());
+        assert_eq!(worktree_count(repo.path()), 2);
+
+        remove_worktree(repo.path(), &wt.path).unwrap();
+
+        assert!(!wt.path.exists(), "the worktree dir must be gone");
+        assert_eq!(
+            worktree_count(repo.path()),
+            1,
+            "only the main worktree may remain registered"
+        );
+    }
+
+    // An interrupted run's tree can hold uncommitted work; `--force` removes it
+    // anyway so terminal cleanup is never blocked by a dirty tree.
+    #[test]
+    fn remove_worktree_forces_removal_of_a_dirty_tree() {
+        let repo = init_repo();
+        let root = repo.path().join(".agentd/workspaces");
+        let wt = prepare_worktree(repo.path(), &root, "ITER-301", None).unwrap();
+        std::fs::write(wt.path.join("dirty.txt"), "uncommitted").unwrap();
+
+        remove_worktree(repo.path(), &wt.path).unwrap();
+
+        assert!(
+            !wt.path.exists(),
+            "a dirty tree must still be removed under --force"
+        );
+    }
+
+    // A removal that git rejects surfaces a distinct, loggable error rather than
+    // a silent success, so the caller can record why cleanup failed.
+    #[test]
+    fn remove_worktree_on_a_missing_tree_is_a_distinct_error() {
+        let repo = init_repo();
+        let missing = repo.path().join(".agentd/workspaces/ITER-404");
+
+        let err = remove_worktree(repo.path(), &missing).unwrap_err();
+
+        assert!(matches!(err, WorktreeRemoveError::Git { .. }), "{err}");
+        assert!(!err.to_string().is_empty());
     }
 
     #[test]

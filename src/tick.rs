@@ -887,6 +887,70 @@ pub fn reconcile<T: Tracker, W: WorktreeLister>(
     })
 }
 
+/// What reconcile_running decided for one live worker, refreshed against its
+/// current lazyspec state (STORY-010). The daemon applies each against the
+/// single-owner store/projection/snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunningAction {
+    /// The item is now terminal: stop the worker and clean its workspace (AC1).
+    TerminateAndClean,
+    /// The item is still active: refresh the snapshot and keep the worker (AC2).
+    Retain,
+    /// The item is neither active nor terminal — a dispatch-role or unmapped
+    /// state, or lazyspec no longer has the doc: stop the worker and free the
+    /// slot, but leave its workspace on disk (AC3).
+    TerminateKeepTree,
+}
+
+/// Reconcile the daemon's live in-flight workers against refreshed lazyspec
+/// state (STORY-010) — the running-worker counterpart to `reconcile`'s pass over
+/// persisted claims.
+///
+/// Every running id is looked up first, before any decision is emitted, so a
+/// single `lookup_doc` failure aborts the whole pass with `Err` and the daemon
+/// takes no action — every worker keeps running and it retries next tick (AC4).
+/// This mirrors `reconcile`'s read-before-write ordering.
+///
+/// With every refresh in hand, each id is classified (`RoleMapping::classify`,
+/// type-aware — a running item is a dispatchable-type doc) into a per-id action:
+/// - terminal → stop the worker and clean its workspace (AC1);
+/// - active → refresh the snapshot, keep the worker running (AC2);
+/// - a dispatch-role or unmapped state, or an absent doc → stop the worker
+///   without cleaning its workspace (AC3).
+pub fn reconcile_running<T: Tracker>(
+    tracker: &T,
+    mapping: &RoleMapping,
+    running_ids: &[String],
+) -> Result<Vec<(String, RunningAction)>, TrackerError> {
+    // Refresh every running id before deciding anything, so one read failure
+    // leaves every worker running (AC4).
+    let mut lookups = Vec::with_capacity(running_ids.len());
+    for id in running_ids {
+        let lookup = tracker.lookup_doc(id)?;
+        lookups.push((id.clone(), lookup));
+    }
+
+    let decisions = lookups
+        .into_iter()
+        .map(|(id, lookup)| {
+            let action = match lookup {
+                DocLookup::Present(view) => match mapping.classify(&view.doc_type, &view.status) {
+                    Some(StateRole::Terminal) => RunningAction::TerminateAndClean,
+                    Some(StateRole::Active) => RunningAction::Retain,
+                    // Dispatch-role or an unmapped state: no longer active, not
+                    // terminal — stop it, but leave the tree (AC3).
+                    Some(StateRole::Dispatch) | None => RunningAction::TerminateKeepTree,
+                },
+                // lazyspec no longer has the doc: the work is gone, so stop the
+                // worker; its tree is not a terminal artifact, so it is left (AC3).
+                DocLookup::Absent => RunningAction::TerminateKeepTree,
+            };
+            (id, action)
+        })
+        .collect();
+    Ok(decisions)
+}
+
 /// Dispatch ordering (STORY-004, ADR-007 / SPEC §8.2): a lower priority number
 /// is more urgent and sorts first (AC1); ties fall to the oldest `created_at`,
 /// then the `identifier` lexicographically for a deterministic total order (AC2);
@@ -2362,6 +2426,94 @@ mod tests {
             store.get("ITER-014").unwrap().unwrap().holder,
             HOLDER,
             "the claim must be untouched"
+        );
+    }
+
+    // STORY-010 AC1: a running item lazyspec now reports terminal decides
+    // terminate-and-clean.
+    #[test]
+    fn reconcile_running_terminal_item_terminates_and_cleans() {
+        let tracker = tracker_with_lookups(HashMap::from([(
+            "ITER-014".to_string(),
+            iteration_doc("ITER-014", "complete"),
+        )]));
+
+        let decisions = reconcile_running(
+            &tracker,
+            &RoleMapping::adr003_default(),
+            &["ITER-014".to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(
+            decisions,
+            vec![("ITER-014".to_string(), RunningAction::TerminateAndClean)]
+        );
+    }
+
+    // STORY-010 AC2: a running item still active decides retain.
+    #[test]
+    fn reconcile_running_active_item_is_retained() {
+        let tracker = tracker_with_lookups(HashMap::from([(
+            "ITER-014".to_string(),
+            iteration_doc("ITER-014", "in-progress"),
+        )]));
+
+        let decisions = reconcile_running(
+            &tracker,
+            &RoleMapping::adr003_default(),
+            &["ITER-014".to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(decisions, vec![("ITER-014".to_string(), RunningAction::Retain)]);
+    }
+
+    // STORY-010 AC3: a running item that is neither active nor terminal — a
+    // dispatch-role state, an unmapped state, or a doc lazyspec no longer has —
+    // decides terminate-without-cleanup.
+    #[test]
+    fn reconcile_running_non_active_non_terminal_item_terminates_without_cleanup() {
+        let tracker = tracker_with_lookups(HashMap::from([
+            ("ITER-a".to_string(), iteration_doc("ITER-a", "accepted")),
+            ("ITER-b".to_string(), iteration_doc("ITER-b", "draft")),
+            ("ITER-c".to_string(), DocLookup::Absent),
+        ]));
+        let ids = vec![
+            "ITER-a".to_string(),
+            "ITER-b".to_string(),
+            "ITER-c".to_string(),
+        ];
+
+        let decisions =
+            reconcile_running(&tracker, &RoleMapping::adr003_default(), &ids).unwrap();
+
+        assert_eq!(
+            decisions,
+            vec![
+                ("ITER-a".to_string(), RunningAction::TerminateKeepTree),
+                ("ITER-b".to_string(), RunningAction::TerminateKeepTree),
+                ("ITER-c".to_string(), RunningAction::TerminateKeepTree),
+            ]
+        );
+    }
+
+    // STORY-010 AC4 + Verification: any refresh failure aborts the whole pass
+    // with an error and emits no decisions, so the daemon acts on none of them.
+    #[test]
+    fn reconcile_running_takes_no_action_when_a_refresh_fails() {
+        let mut tracker = tracker_with_lookups(HashMap::new());
+        tracker.lookup_fails = true;
+
+        let result = reconcile_running(
+            &tracker,
+            &RoleMapping::adr003_default(),
+            &["ITER-014".to_string(), "ITER-015".to_string()],
+        );
+
+        assert!(
+            matches!(result, Err(TrackerError::Command { .. })),
+            "a refresh failure must surface as an error to retry: {result:?}"
         );
     }
 }

@@ -1,7 +1,7 @@
 ---
 title: Stop a running agent when its item goes terminal
 type: iteration
-status: review
+status: complete
 author: Jack Kaloger
 date: 2026-07-14
 tags: []

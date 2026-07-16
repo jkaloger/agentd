@@ -17,11 +17,11 @@ use crate::projection::{EventKind, Projection, Snapshot};
 use crate::prompt;
 use crate::store::Store;
 use crate::tick::{
-    DispatchOutcome, RunRecord, SkipClaim, TickReport, WorkerCompletion, dispatch_one, finalize,
-    reconcile, run_worker,
+    DispatchOutcome, RunRecord, RunningAction, SkipClaim, TickReport, WorkerCompletion,
+    dispatch_one, finalize, reconcile, reconcile_running, run_worker,
 };
 use crate::tracker::Tracker;
-use crate::workspace::DiskWorktrees;
+use crate::workspace::{DiskWorktrees, remove_worktree};
 
 const HOLDER: &str = "agentd";
 
@@ -88,6 +88,12 @@ struct RunningItem {
     /// (STORY-006, ADR-007).
     state: String,
     started_at_ms: u64,
+    /// The isolated worktree this run occupies (ADR-005), so a terminal reconcile
+    /// can clean it (STORY-010 AC1). Its deterministic location — `<repo>/
+    /// <workspace.root>/<id>` — matches what `run_worker` prepares.
+    worktree: PathBuf,
+    /// The stop handle for the in-flight turn: aborting it terminates the worker
+    /// (the orchestrator, not the agent, decides to stop — ADR-001).
     handle: JoinHandle<()>,
 }
 
@@ -393,6 +399,10 @@ where
                         let id = dispatch.candidate.id.clone();
                         let identifier = dispatch.candidate.identifier.clone();
                         let started_at_ms = now_ms();
+                        // The worktree `run_worker` will prepare for this run
+                        // (ADR-005): its deterministic path, held so a terminal
+                        // reconcile can clean it (STORY-010 AC1).
+                        let worktree = repo.join(&config.workspace.root).join(&id);
                         let worker_tracker = tracker.clone();
                         let worker_adapter = adapter.clone();
                         let worker_config = config.clone();
@@ -416,6 +426,7 @@ where
                             identifier,
                             state: active_state.clone(),
                             started_at_ms,
+                            worktree,
                             handle,
                         });
                     }
@@ -425,6 +436,22 @@ where
                     }
                 }
             }
+
+            // Reconcile the live workers against refreshed lazyspec state
+            // (STORY-010): stop any whose item went terminal (cleaning its tree)
+            // or otherwise left the active set, and refresh the snapshot for those
+            // still active. A refresh failure leaves every worker running.
+            let mapping = RoleMapping::from_config(&config);
+            reconcile_running_workers(
+                tracker.as_ref(),
+                &mapping,
+                &store,
+                &projection,
+                &snapshot,
+                &worker_state,
+                &repo,
+                now,
+            );
 
             // Re-read the interval fresh so a reload governs the next wait only
             // (ADR-006/ADR-007). The loop never blocks on a turn: it races the poll
@@ -552,6 +579,90 @@ fn handle_completion(
         });
     }
     state.records.push(record);
+}
+
+/// Reconcile the live in-flight workers against refreshed lazyspec state
+/// (STORY-010) — the running-worker counterpart to the persisted-claim
+/// `reconcile`. Every running id is refreshed first (`reconcile_running`), so a
+/// single read failure aborts the pass and leaves every worker running to retry
+/// next tick (AC4). Each surviving decision is applied against the single-owner
+/// store/projection/snapshot:
+/// - terminal: stop the worker, remove its worktree, release the claim (AC1);
+/// - active: refresh the snapshot, keep the worker running (AC2);
+/// - neither: stop the worker and release the claim, leaving the tree (AC3).
+#[allow(clippy::too_many_arguments)]
+fn reconcile_running_workers<T: Tracker>(
+    tracker: &T,
+    mapping: &RoleMapping,
+    store: &Store,
+    projection: &Projection,
+    snapshot: &Snapshot,
+    state: &SharedState,
+    repo: &Path,
+    now: u64,
+) {
+    let ids: Vec<String> = {
+        let state = state.lock().unwrap();
+        state.running.iter().map(|item| item.id.clone()).collect()
+    };
+    if ids.is_empty() {
+        return;
+    }
+
+    // AC4: a refresh failure leaves every worker running; retry next tick.
+    let Ok(decisions) = reconcile_running(tracker, mapping, &ids) else {
+        return;
+    };
+
+    let mut mutated = false;
+    for (id, action) in decisions {
+        match action {
+            // AC2: keep the worker; refresh the ref against the retained claim.
+            RunningAction::Retain => {
+                if let Ok(Some(held)) = store.get(&id) {
+                    snapshot.set_ref(&id, &held.holder, held.fence);
+                    mutated = true;
+                }
+            }
+            // AC1: stop the worker, remove its worktree, then free the slot.
+            RunningAction::TerminateAndClean => {
+                if let Some(worktree) = stop_running(state, &id)
+                    && let Err(e) = remove_worktree(repo, &worktree)
+                {
+                    eprintln!(
+                        "agentd: warning: could not remove worktree {} for {id}: {e}",
+                        worktree.display()
+                    );
+                }
+                let _ = store.release(&id);
+                projection.record(now, &id, EventKind::ReconcileRelease, &[]);
+                snapshot.remove_ref(&id);
+                mutated = true;
+            }
+            // AC3: stop the worker and free the slot, leaving the tree on disk.
+            RunningAction::TerminateKeepTree => {
+                stop_running(state, &id);
+                let _ = store.release(&id);
+                projection.record(now, &id, EventKind::ReconcileRelease, &[]);
+                snapshot.remove_ref(&id);
+                mutated = true;
+            }
+        }
+    }
+    if mutated && let Ok(claims) = store.claims() {
+        snapshot.write_state(&claims);
+    }
+}
+
+/// Abort the live worker for `id`, drop it from the registry, and hand back the
+/// worktree it occupied so a terminal reconcile can clean it (ADR-001: the
+/// orchestrator, not the agent, stops the run). `None` if no such worker.
+fn stop_running(state: &SharedState, id: &str) -> Option<PathBuf> {
+    let mut state = state.lock().unwrap();
+    let idx = state.running.iter().position(|item| item.id == id)?;
+    let item = state.running.remove(idx);
+    item.handle.abort();
+    Some(item.worktree)
 }
 
 /// Mirror a dispatch pass that produced no worker (STORY-019 AC1 / STORY-061 AC1).
@@ -824,15 +935,31 @@ mod tests {
             Ok(self.parent.clone())
         }
 
-        fn lookup_doc(&self, _id: &str) -> Result<DocLookup, TrackerError> {
-            // The blocker gate (STORY-061) looks the candidate's parent up here.
-            // Return the real parent — a story — so terminality is decided by its
-            // actual status, not a fabricated type.
-            Ok(DocLookup::Present(self.parent.clone()))
+        fn lookup_doc(&self, id: &str) -> Result<DocLookup, TrackerError> {
+            // The blocker gate (STORY-061) looks the candidate's parent up here;
+            // return the real parent — a story — so its actual status decides
+            // terminality. A running iteration (STORY-010) refreshes to its own
+            // active doc, so reconcile_running retains it.
+            if id == self.parent.id {
+                return Ok(DocLookup::Present(self.parent.clone()));
+            }
+            Ok(DocLookup::Present(active_iteration(id)))
         }
 
         fn advance(&self, _id: &str, _target: &str) -> Result<(), TrackerError> {
             Ok(())
+        }
+    }
+
+    /// A running iteration's own doc, active (in-progress) so a running-worker
+    /// reconcile pass retains it (STORY-010 AC2).
+    fn active_iteration(id: &str) -> DocView {
+        DocView {
+            id: id.to_string(),
+            doc_type: "iteration".to_string(),
+            title: String::new(),
+            body: String::new(),
+            status: "in-progress".to_string(),
         }
     }
 
@@ -857,8 +984,11 @@ mod tests {
             Ok(self.parent.clone())
         }
 
-        fn lookup_doc(&self, _id: &str) -> Result<DocLookup, TrackerError> {
-            Ok(DocLookup::Present(self.parent.clone()))
+        fn lookup_doc(&self, id: &str) -> Result<DocLookup, TrackerError> {
+            if id == self.parent.id {
+                return Ok(DocLookup::Present(self.parent.clone()));
+            }
+            Ok(DocLookup::Present(active_iteration(id)))
         }
 
         fn advance(&self, _id: &str, _target: &str) -> Result<(), TrackerError> {
@@ -2000,6 +2130,295 @@ max_concurrent = 5
         daemon.shutdown().await;
 
         assert!(!socket_path.exists());
+    }
+
+    /// A tracker fake for the running-worker reconcile pass: each id resolves to
+    /// a seeded `lookup_doc`, or `fail` makes every lookup a read failure.
+    struct ReconcileTracker {
+        lookups: std::collections::HashMap<String, DocLookup>,
+        fail: bool,
+    }
+
+    impl Tracker for ReconcileTracker {
+        fn fetch_dispatchable(&self) -> Result<Vec<Candidate>, TrackerError> {
+            Ok(Vec::new())
+        }
+
+        fn fetch_doc(&self, id: &str) -> Result<DocView, TrackerError> {
+            Ok(active_iteration(id))
+        }
+
+        fn lookup_doc(&self, id: &str) -> Result<DocLookup, TrackerError> {
+            if self.fail {
+                return Err(TrackerError::Command {
+                    code: Some(1),
+                    stderr: "lazyspec unreadable".to_string(),
+                });
+            }
+            Ok(self.lookups.get(id).cloned().unwrap_or(DocLookup::Absent))
+        }
+
+        fn advance(&self, _id: &str, _target: &str) -> Result<(), TrackerError> {
+            Ok(())
+        }
+    }
+
+    fn iteration_lookup(id: &str, status: &str) -> DocLookup {
+        DocLookup::Present(DocView {
+            id: id.to_string(),
+            doc_type: "iteration".to_string(),
+            title: String::new(),
+            body: String::new(),
+            status: status.to_string(),
+        })
+    }
+
+    /// A registry entry backed by a live (abortable) task standing in for the
+    /// in-flight turn and the worktree it occupies.
+    fn running_item_for(id: &str, worktree: PathBuf) -> RunningItem {
+        RunningItem {
+            id: id.to_string(),
+            identifier: format!("iter-{id}"),
+            state: "in-progress".to_string(),
+            started_at_ms: now_ms(),
+            worktree,
+            handle: tokio::spawn(std::future::pending::<()>()),
+        }
+    }
+
+    fn abort_remaining(state: &SharedState) {
+        for item in state.lock().unwrap().running.drain(..) {
+            item.handle.abort();
+        }
+    }
+
+    // STORY-010 AC1: a running item now terminal is terminated, its worktree is
+    // removed, and its claim is released so the slot frees.
+    #[tokio::test]
+    async fn reconcile_running_stops_a_terminal_worker_and_cleans_its_tree() {
+        let (repo, config_path, _socket) = init_project("");
+        let store_dir = config_path.parent().unwrap().to_path_buf();
+        let store = Store::open(&store_dir.join("store.redb")).unwrap();
+        let projection = Projection::new(store_dir.join("log"));
+        let snapshot = Snapshot::new(store_dir.clone());
+        let root = repo.path().join("workspaces");
+        let wt = crate::workspace::prepare_worktree(repo.path(), &root, "ITER-500", None).unwrap();
+        store
+            .claim("ITER-500", HOLDER, now_ms(), crate::tick::DEFAULT_LEASE_TTL)
+            .unwrap();
+
+        let state: SharedState = Arc::new(Mutex::new(DaemonState::default()));
+        state
+            .lock()
+            .unwrap()
+            .running
+            .push(running_item_for("ITER-500", wt.path.clone()));
+
+        let tracker = ReconcileTracker {
+            lookups: std::collections::HashMap::from([(
+                "ITER-500".to_string(),
+                iteration_lookup("ITER-500", "complete"),
+            )]),
+            fail: false,
+        };
+
+        reconcile_running_workers(
+            &tracker,
+            &RoleMapping::from_config(&load_str("").unwrap()),
+            &store,
+            &projection,
+            &snapshot,
+            &state,
+            repo.path(),
+            now_ms(),
+        );
+
+        assert!(
+            state.lock().unwrap().running.is_empty(),
+            "a terminal worker must be stopped and dropped from the registry"
+        );
+        assert!(!wt.path.exists(), "its worktree must be removed");
+        assert_eq!(
+            store.get("ITER-500").unwrap(),
+            None,
+            "its claim must be released"
+        );
+    }
+
+    // STORY-010 AC2: a running item still active keeps running and its snapshot
+    // ref is refreshed; its worktree and claim are left untouched.
+    #[tokio::test]
+    async fn reconcile_running_retains_an_active_worker_and_refreshes_the_snapshot() {
+        let (repo, config_path, _socket) = init_project("");
+        let store_dir = config_path.parent().unwrap().to_path_buf();
+        let store = Store::open(&store_dir.join("store.redb")).unwrap();
+        let projection = Projection::new(store_dir.join("log"));
+        let snapshot = Snapshot::new(store_dir.clone());
+        let root = repo.path().join("workspaces");
+        let wt = crate::workspace::prepare_worktree(repo.path(), &root, "ITER-501", None).unwrap();
+        store
+            .claim("ITER-501", HOLDER, now_ms(), crate::tick::DEFAULT_LEASE_TTL)
+            .unwrap();
+
+        let state: SharedState = Arc::new(Mutex::new(DaemonState::default()));
+        state
+            .lock()
+            .unwrap()
+            .running
+            .push(running_item_for("ITER-501", wt.path.clone()));
+
+        let tracker = ReconcileTracker {
+            lookups: std::collections::HashMap::from([(
+                "ITER-501".to_string(),
+                iteration_lookup("ITER-501", "in-progress"),
+            )]),
+            fail: false,
+        };
+
+        reconcile_running_workers(
+            &tracker,
+            &RoleMapping::from_config(&load_str("").unwrap()),
+            &store,
+            &projection,
+            &snapshot,
+            &state,
+            repo.path(),
+            now_ms(),
+        );
+
+        assert_eq!(
+            state.lock().unwrap().running.len(),
+            1,
+            "an active worker must keep running"
+        );
+        assert!(wt.path.exists(), "an active worker's tree stays on disk");
+        assert!(
+            store.get("ITER-501").unwrap().is_some(),
+            "an active worker's claim is retained"
+        );
+        assert!(
+            store_dir
+                .join("refs")
+                .join("claims")
+                .join("ITER-501")
+                .exists(),
+            "the snapshot ref must be refreshed for an active worker"
+        );
+
+        abort_remaining(&state);
+    }
+
+    // STORY-010 AC3: a running item neither active nor terminal (here a
+    // dispatch-role state) is terminated and its claim released, but its worktree
+    // is left on disk for inspection.
+    #[tokio::test]
+    async fn reconcile_running_stops_a_non_active_non_terminal_worker_but_keeps_its_tree() {
+        let (repo, config_path, _socket) = init_project("");
+        let store_dir = config_path.parent().unwrap().to_path_buf();
+        let store = Store::open(&store_dir.join("store.redb")).unwrap();
+        let projection = Projection::new(store_dir.join("log"));
+        let snapshot = Snapshot::new(store_dir.clone());
+        let root = repo.path().join("workspaces");
+        let wt = crate::workspace::prepare_worktree(repo.path(), &root, "ITER-502", None).unwrap();
+        store
+            .claim("ITER-502", HOLDER, now_ms(), crate::tick::DEFAULT_LEASE_TTL)
+            .unwrap();
+
+        let state: SharedState = Arc::new(Mutex::new(DaemonState::default()));
+        state
+            .lock()
+            .unwrap()
+            .running
+            .push(running_item_for("ITER-502", wt.path.clone()));
+
+        let tracker = ReconcileTracker {
+            lookups: std::collections::HashMap::from([(
+                "ITER-502".to_string(),
+                iteration_lookup("ITER-502", "accepted"),
+            )]),
+            fail: false,
+        };
+
+        reconcile_running_workers(
+            &tracker,
+            &RoleMapping::from_config(&load_str("").unwrap()),
+            &store,
+            &projection,
+            &snapshot,
+            &state,
+            repo.path(),
+            now_ms(),
+        );
+
+        assert!(
+            state.lock().unwrap().running.is_empty(),
+            "a non-active, non-terminal worker must be stopped"
+        );
+        assert!(
+            wt.path.exists(),
+            "a non-terminal worker's tree must be left on disk (no cleanup)"
+        );
+        assert_eq!(
+            store.get("ITER-502").unwrap(),
+            None,
+            "the slot must free — the claim is released"
+        );
+    }
+
+    // STORY-010 AC4 + Verification: when the refresh fails, no worker is stopped,
+    // no worktree removed, and no claim released — every worker survives to retry.
+    #[tokio::test]
+    async fn reconcile_running_leaves_every_worker_running_when_the_refresh_fails() {
+        let (repo, config_path, _socket) = init_project("");
+        let store_dir = config_path.parent().unwrap().to_path_buf();
+        let store = Store::open(&store_dir.join("store.redb")).unwrap();
+        let projection = Projection::new(store_dir.join("log"));
+        let snapshot = Snapshot::new(store_dir.clone());
+        let root = repo.path().join("workspaces");
+        let wt3 = crate::workspace::prepare_worktree(repo.path(), &root, "ITER-503", None).unwrap();
+        let wt4 = crate::workspace::prepare_worktree(repo.path(), &root, "ITER-504", None).unwrap();
+        store
+            .claim("ITER-503", HOLDER, now_ms(), crate::tick::DEFAULT_LEASE_TTL)
+            .unwrap();
+        store
+            .claim("ITER-504", HOLDER, now_ms(), crate::tick::DEFAULT_LEASE_TTL)
+            .unwrap();
+
+        let state: SharedState = Arc::new(Mutex::new(DaemonState::default()));
+        {
+            let mut s = state.lock().unwrap();
+            s.running.push(running_item_for("ITER-503", wt3.path.clone()));
+            s.running.push(running_item_for("ITER-504", wt4.path.clone()));
+        }
+
+        let tracker = ReconcileTracker {
+            lookups: std::collections::HashMap::new(),
+            fail: true,
+        };
+
+        reconcile_running_workers(
+            &tracker,
+            &RoleMapping::from_config(&load_str("").unwrap()),
+            &store,
+            &projection,
+            &snapshot,
+            &state,
+            repo.path(),
+            now_ms(),
+        );
+
+        assert_eq!(
+            state.lock().unwrap().running.len(),
+            2,
+            "a refresh failure must leave every worker running"
+        );
+        assert!(wt3.path.exists() && wt4.path.exists(), "no tree may be removed");
+        assert!(
+            store.get("ITER-503").unwrap().is_some() && store.get("ITER-504").unwrap().is_some(),
+            "no claim may be released on a refresh failure"
+        );
+
+        abort_remaining(&state);
     }
 
     #[tokio::test]
