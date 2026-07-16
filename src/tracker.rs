@@ -601,6 +601,30 @@ mod tests {
     }
 
     #[test]
+    fn lookup_doc_refresh_of_a_terminal_doc_classifies_as_terminal() {
+        // STORY-023 AC2: a refreshed now-terminal doc reports the terminal role,
+        // driven through the seam (lookup_doc -> DocView -> RoleMapping::classify).
+        let mapping = RoleMapping::adr003_default();
+        let tracker = LazyspecTracker::new(
+            FakeCli::ok(r#"{"documents":[]}"#).with_body(
+                "ITER-032",
+                r#"{"id":"ITER-032","type":"iteration","title":"T","body":"B","status":"complete"}"#,
+            ),
+            mapping.clone(),
+        );
+
+        let view = match tracker.lookup_doc("ITER-032").unwrap() {
+            DocLookup::Present(view) => view,
+            DocLookup::Absent => panic!("expected Present"),
+        };
+
+        assert_eq!(
+            mapping.classify(&view.doc_type, &view.status),
+            Some(StateRole::Terminal)
+        );
+    }
+
+    #[test]
     fn lookup_doc_maps_a_not_found_exit_to_absent() {
         let tracker = LazyspecTracker::new(
             FailingShow {
