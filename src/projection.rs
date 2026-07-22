@@ -35,6 +35,11 @@ pub enum EventKind {
     /// reason so the stuck item is offline-inspectable. The claim was released, so
     /// a `Release` line accompanies it; no additional store change backs this line.
     GateRejected,
+    /// A tick that skipped new dispatch after a fault the preflight caught
+    /// (STORY-012): an invalid on-disk config or a candidate-fetch failure. Recorded
+    /// with the fault's message so the operator sees why dispatch paused; reconcile
+    /// still ran, so no dispatch happened and no store change backs this line.
+    DispatchSkipped,
 }
 
 impl fmt::Display for EventKind {
@@ -49,6 +54,7 @@ impl fmt::Display for EventKind {
             EventKind::RetryCleared => "retry_cleared",
             EventKind::Blocked => "blocked",
             EventKind::GateRejected => "gate_rejected",
+            EventKind::DispatchSkipped => "dispatch_skipped",
         };
         write!(f, "{s}")
     }

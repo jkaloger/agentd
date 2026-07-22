@@ -57,6 +57,11 @@ struct DaemonState {
     /// mirroring the durable retry schedule so `status` can render each with its
     /// attempt and error. Keyed by id: a re-scheduled retry replaces its entry.
     queued: Vec<QueuedRetry>,
+    /// The most recent tick's dispatch fault (STORY-012): an invalid on-disk config
+    /// the per-tick preflight rejected, or a candidate-fetch failure. Set when a
+    /// tick skips dispatch, cleared when a tick's preflight passes, so an operator
+    /// can see that new dispatch is paused while reconciliation keeps running.
+    dispatch_error: Option<String>,
 }
 
 /// A pending retry surfaced in `status` (STORY-008 AC3): which attempt it is and
@@ -309,6 +314,8 @@ where
     let state: SharedState = Arc::new(Mutex::new(DaemonState::default()));
     let (shutdown_tx, _) = watch::channel(false);
 
+    // Owned so the worker can re-read and re-validate it every tick (STORY-012).
+    let config_path = config_path.to_path_buf();
     let store_dir = config_path
         .parent()
         .map(Path::to_path_buf)
@@ -370,103 +377,146 @@ where
         let mut suppressed: HashSet<String> = HashSet::new();
 
         loop {
-            // Fill free slots (ADR-007/ADR-008): dispatch up to `max_concurrent`
-            // minus the live workers, in priority order, spawning a worker per
-            // claim without awaiting its turn. Once no eligible candidate remains
-            // (`dispatch_one` skips live-claimed ids, so consecutive calls select
-            // distinct candidates), the pass stops and its report is mirrored.
+            // Last-known-good config: it drives the safety reconcile and the poll
+            // wait regardless of what the on-disk config validates to (STORY-012).
             let config = config_rx.borrow().clone();
             let now = now_ms();
-            // The active state a claimed worker will occupy (ADR-008); the
-            // per-status cap (STORY-006) tallies live workers against it.
-            let active_state = config.transitions.claim.to_lowercase();
-            let slots = (config.max_concurrent as usize)
-                .saturating_sub(worker_state.lock().unwrap().live_worker_count());
-            for _ in 0..slots {
-                // Skip a candidate whose active state is already at its configured
-                // cap, reading the live registry so a within-tick burst counts too
-                // (a just-dispatched worker is pushed before the next call). No cap
-                // for the state means the global slot count alone governs (AC2).
-                let at_status_cap = |state: &str| match config.per_status_caps.get(state) {
-                    Some(&cap) => {
-                        let running = worker_state
-                            .lock()
-                            .unwrap()
-                            .running
-                            .iter()
-                            .filter(|item| item.state == state)
-                            .count();
-                        running as u32 >= cap
-                    }
-                    None => false,
-                };
-                match dispatch_one(
-                    tracker.as_ref(),
-                    &store,
-                    &config,
-                    now,
-                    HOLDER,
-                    |_| {},
-                    at_status_cap,
-                    |id: &str| suppressed.contains(id),
-                ) {
-                    DispatchOutcome::Dispatched(dispatch) => {
-                        let id = dispatch.candidate.id.clone();
-                        let identifier = dispatch.candidate.identifier.clone();
-                        let attempt = dispatch.attempt;
-                        let started_at_ms = now_ms();
-                        // The worktree `run_worker` will prepare for this run
-                        // (ADR-005): its deterministic path, held so a terminal
-                        // reconcile can clean it (STORY-010 AC1).
-                        let worktree = repo.join(&config.workspace.root).join(&id);
-                        let worker_tracker = tracker.clone();
-                        let worker_adapter = adapter.clone();
-                        let worker_config = config.clone();
-                        let worker_template = template.clone();
-                        let worker_repo = repo.clone();
-                        let tx = completion_tx.clone();
-                        let progress = progress_tx.clone();
-                        let progress_id = id.clone();
-                        let handle = tokio::spawn(async move {
-                            let on_progress = move || {
-                                let _ = progress.send((progress_id.clone(), now_ms()));
-                            };
-                            let completion = run_worker(
-                                worker_tracker.as_ref(),
-                                worker_adapter.as_ref(),
-                                &worker_config,
-                                &worker_template,
-                                &worker_repo,
-                                dispatch,
-                                &on_progress,
-                            )
-                            .await;
-                            let _ = tx.send(completion);
-                        });
-                        worker_state.lock().unwrap().running.push(RunningItem {
-                            id,
-                            identifier,
-                            state: active_state.clone(),
-                            started_at_ms,
-                            worktree,
-                            handle,
-                            last_event_at_ms: None,
-                            attempt,
-                        });
-                    }
-                    DispatchOutcome::NoDispatch(report) => {
-                        // A gate refusal suppresses the id for this daemon's
-                        // lifetime so later ticks neither re-claim nor re-log it
-                        // (STORY-027 AC3); a transport skip leaves it retryable.
-                        if let TickReport::Skipped {
-                            id, gate: Some(_), ..
-                        } = &report
-                        {
-                            suppressed.insert(id.clone());
+
+            // Per-tick dispatch preflight (STORY-012, ADR-002): re-read and
+            // re-validate the on-disk config. A valid config governs this tick's
+            // dispatch; an invalid one skips dispatch and surfaces the fault to the
+            // operator, leaving the safety reconcile below to run either way — a bad
+            // config pauses new work without freezing reconciliation (AC1). The fresh
+            // config is used only for dispatch, so a hot-edited value takes effect
+            // here while reconcile stays on the last-known-good (out of scope: any
+            // richer hot-reload).
+            match config::load(&config_path) {
+                Ok(config) => {
+                    worker_state.lock().unwrap().dispatch_error = None;
+                    // Fill free slots (ADR-007/ADR-008): dispatch up to
+                    // `max_concurrent` minus the live workers, in priority order,
+                    // spawning a worker per claim without awaiting its turn. Once no
+                    // eligible candidate remains (`dispatch_one` skips live-claimed
+                    // ids, so consecutive calls select distinct candidates), the pass
+                    // stops and its report is mirrored.
+                    //
+                    // The active state a claimed worker will occupy (ADR-008); the
+                    // per-status cap (STORY-006) tallies live workers against it.
+                    let active_state = config.transitions.claim.to_lowercase();
+                    let slots = (config.max_concurrent as usize)
+                        .saturating_sub(worker_state.lock().unwrap().live_worker_count());
+                    for _ in 0..slots {
+                        // Skip a candidate whose active state is already at its
+                        // configured cap, reading the live registry so a within-tick
+                        // burst counts too (a just-dispatched worker is pushed before
+                        // the next call). No cap for the state means the global slot
+                        // count alone governs (AC2).
+                        let at_status_cap = |state: &str| match config.per_status_caps.get(state) {
+                            Some(&cap) => {
+                                let running = worker_state
+                                    .lock()
+                                    .unwrap()
+                                    .running
+                                    .iter()
+                                    .filter(|item| item.state == state)
+                                    .count();
+                                running as u32 >= cap
+                            }
+                            None => false,
+                        };
+                        match dispatch_one(
+                            tracker.as_ref(),
+                            &store,
+                            &config,
+                            now,
+                            HOLDER,
+                            |_| {},
+                            at_status_cap,
+                            |id: &str| suppressed.contains(id),
+                        ) {
+                            DispatchOutcome::Dispatched(dispatch) => {
+                                let id = dispatch.candidate.id.clone();
+                                let identifier = dispatch.candidate.identifier.clone();
+                                let attempt = dispatch.attempt;
+                                let started_at_ms = now_ms();
+                                // The worktree `run_worker` will prepare for this run
+                                // (ADR-005): its deterministic path, held so a
+                                // terminal reconcile can clean it (STORY-010 AC1).
+                                let worktree = repo.join(&config.workspace.root).join(&id);
+                                let worker_tracker = tracker.clone();
+                                let worker_adapter = adapter.clone();
+                                let worker_config = config.clone();
+                                let worker_template = template.clone();
+                                let worker_repo = repo.clone();
+                                let tx = completion_tx.clone();
+                                let progress = progress_tx.clone();
+                                let progress_id = id.clone();
+                                let handle = tokio::spawn(async move {
+                                    let on_progress = move || {
+                                        let _ = progress.send((progress_id.clone(), now_ms()));
+                                    };
+                                    let completion = run_worker(
+                                        worker_tracker.as_ref(),
+                                        worker_adapter.as_ref(),
+                                        &worker_config,
+                                        &worker_template,
+                                        &worker_repo,
+                                        dispatch,
+                                        &on_progress,
+                                    )
+                                    .await;
+                                    let _ = tx.send(completion);
+                                });
+                                worker_state.lock().unwrap().running.push(RunningItem {
+                                    id,
+                                    identifier,
+                                    state: active_state.clone(),
+                                    started_at_ms,
+                                    worktree,
+                                    handle,
+                                    last_event_at_ms: None,
+                                    attempt,
+                                });
+                            }
+                            DispatchOutcome::NoDispatch(report) => {
+                                // A gate refusal suppresses the id for this daemon's
+                                // lifetime so later ticks neither re-claim nor re-log
+                                // it (STORY-027 AC3); a transport skip leaves it
+                                // retryable.
+                                if let TickReport::Skipped {
+                                    id, gate: Some(_), ..
+                                } = &report
+                                {
+                                    suppressed.insert(id.clone());
+                                }
+                                // A candidate-fetch failure (STORY-012 AC3): surface
+                                // it to the operator instead of letting it fall into
+                                // `mirror_nondispatch`'s silently-dropped `Error` arm.
+                                // Reconcile already ran, so nothing was dispatched and
+                                // the worker stays healthy to reschedule.
+                                if let TickReport::Error(reason) = &report {
+                                    projection.record(
+                                        now,
+                                        "-",
+                                        EventKind::DispatchSkipped,
+                                        &[("reason", reason)],
+                                    );
+                                    worker_state.lock().unwrap().dispatch_error =
+                                        Some(reason.clone());
+                                }
+                                mirror_nondispatch(report, &projection, &snapshot, &store, now);
+                                break;
+                            }
                         }
-                        mirror_nondispatch(report, &projection, &snapshot, &store, now);
-                        break;
                     }
+                }
+                Err(e) => {
+                    // STORY-012 AC1: the on-disk config is invalid — skip dispatch
+                    // this tick and surface the fault to the event log and daemon
+                    // state, not the dropped `Error` arm. Reconcile below still runs.
+                    let reason = e.to_string();
+                    projection.record(now, "-", EventKind::DispatchSkipped, &[("reason", &reason)]);
+                    worker_state.lock().unwrap().dispatch_error = Some(reason);
                 }
             }
 
@@ -1905,17 +1955,17 @@ mod tests {
     // two of the four eligible candidates are dispatched and the status stays there.
     #[tokio::test]
     async fn a_per_status_cap_holds_a_status_below_the_global_limit() {
-        let (_repo, config_path, _socket) = init_project("");
-        let (adapter, gate) = blocking_adapter();
-        let (tracker, _fetches) = multi_tracker(4);
-        let mut config = load_str(
-            r#"
+        // The dispatch preflight re-reads config from disk (STORY-012), so the caps
+        // must live in the on-disk config, not only the in-memory one.
+        let cfg = r#"
 max_concurrent = 5
 [concurrency.per_status]
 "in-progress" = 2
-"#,
-        )
-        .unwrap();
+"#;
+        let (_repo, config_path, _socket) = init_project(cfg);
+        let (adapter, gate) = blocking_adapter();
+        let (tracker, _fetches) = multi_tracker(4);
+        let mut config = load_str(cfg).unwrap();
         config.poll_interval_ms = 5;
         let orch = spawn_orchestrator(&config_path, config, tracker, adapter);
 
@@ -1944,17 +1994,16 @@ max_concurrent = 5
     // ("in-progress"), so the global cap of 2 alone governs.
     #[tokio::test]
     async fn an_uncapped_status_dispatches_up_to_the_global_limit() {
-        let (_repo, config_path, _socket) = init_project("");
-        let (adapter, gate) = blocking_adapter();
-        let (tracker, _fetches) = multi_tracker(3);
-        let mut config = load_str(
-            r#"
+        // Dispatch reads config from disk (STORY-012), so the caps go on disk.
+        let cfg = r#"
 max_concurrent = 2
 [concurrency.per_status]
 "review" = 1
-"#,
-        )
-        .unwrap();
+"#;
+        let (_repo, config_path, _socket) = init_project(cfg);
+        let (adapter, gate) = blocking_adapter();
+        let (tracker, _fetches) = multi_tracker(3);
+        let mut config = load_str(cfg).unwrap();
         config.poll_interval_ms = 5;
         let orch = spawn_orchestrator(&config_path, config, tracker, adapter);
 
@@ -1982,17 +2031,16 @@ max_concurrent = 2
     // state at 1, holding it there even with global slots free.
     #[tokio::test]
     async fn a_mixed_case_cap_key_matches_the_active_state() {
-        let (_repo, config_path, _socket) = init_project("");
-        let (adapter, gate) = blocking_adapter();
-        let (tracker, _fetches) = multi_tracker(3);
-        let mut config = load_str(
-            r#"
+        // Dispatch reads config from disk (STORY-012), so the cap goes on disk.
+        let cfg = r#"
 max_concurrent = 5
 [concurrency.per_status]
 "In-Progress" = 1
-"#,
-        )
-        .unwrap();
+"#;
+        let (_repo, config_path, _socket) = init_project(cfg);
+        let (adapter, gate) = blocking_adapter();
+        let (tracker, _fetches) = multi_tracker(3);
+        let mut config = load_str(cfg).unwrap();
         config.poll_interval_ms = 5;
         let orch = spawn_orchestrator(&config_path, config, tracker, adapter);
 
@@ -2820,6 +2868,175 @@ max_concurrent = 5
         );
 
         drain_all(orch, &gate).await;
+    }
+
+    /// A tracker whose candidate fetch always fails, counting attempts so a test can
+    /// prove the loop keeps ticking (rescheduling) after a fetch error. `lookup_doc`
+    /// and `advance` are never reached — a failed fetch dispatches nothing.
+    struct FetchFailingTracker {
+        fetches: Arc<AtomicUsize>,
+    }
+
+    impl Tracker for FetchFailingTracker {
+        fn fetch_dispatchable(&self) -> Result<Vec<Candidate>, TrackerError> {
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            Err(TrackerError::Command {
+                code: Some(1),
+                stderr: "lazyspec query failed".to_string(),
+            })
+        }
+
+        fn fetch_doc(&self, id: &str) -> Result<DocView, TrackerError> {
+            Ok(active_iteration(id))
+        }
+
+        fn lookup_doc(&self, id: &str) -> Result<DocLookup, TrackerError> {
+            Ok(DocLookup::Present(active_iteration(id)))
+        }
+
+        fn advance(&self, _id: &str, _target: &str) -> Result<(), TrackerError> {
+            Ok(())
+        }
+    }
+
+    async fn wait_for_dispatch_error(state: &SharedState) -> String {
+        for _ in 0..400 {
+            if let Some(msg) = state.lock().unwrap().dispatch_error.clone() {
+                return msg;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("no dispatch error surfaced");
+    }
+
+    // STORY-012 AC1 + Verification: a bad on-disk config pauses new dispatch without
+    // freezing safety reconciliation. The daemon starts from a valid last-known-good
+    // config, so startup reconcile still releases an expired orphan (a store
+    // mutation), while the per-tick preflight — seeing the invalid on-disk config —
+    // skips dispatch, never claiming the eligible candidate, and surfaces the fault.
+    #[tokio::test]
+    async fn an_invalid_config_skips_dispatch_but_still_reconciles() {
+        // The on-disk config is invalid (poll_interval_ms = 0 fails validation).
+        let (_repo, config_path, _socket) = init_project("poll_interval_ms = 0");
+        let store_dir = config_path.parent().unwrap().to_path_buf();
+
+        // An expired orphan the tracker never offers: startup reconcile must release
+        // it — the reconcile store mutation the invariant checks for.
+        {
+            let store = Store::open(&store_dir.join("store.redb")).unwrap();
+            store
+                .claim("ITER-100", "dead", 0, Duration::from_millis(1))
+                .unwrap();
+        }
+
+        let (adapter, gate) = blocking_adapter();
+        // The passed-in config is valid, so reconcile runs on last-known-good.
+        let mut config = load_str("").unwrap();
+        config.poll_interval_ms = 5;
+        let orch = spawn_orchestrator(&config_path, config, fake_tracker(), adapter);
+
+        let message = wait_for_dispatch_error(&orch.state).await;
+        assert!(
+            message.contains("poll_interval_ms"),
+            "the surfaced error names the bad config key: {message}"
+        );
+
+        drain_all(orch, &gate).await;
+
+        // The invariant: reconcile mutated the store AND dispatch was skipped.
+        let store = Store::open(&store_dir.join("store.redb")).unwrap();
+        assert_eq!(
+            store.get("ITER-100").unwrap(),
+            None,
+            "reconcile must still release the expired orphan under a bad config"
+        );
+        assert_eq!(
+            store.get("ITER-014").unwrap(),
+            None,
+            "an invalid config skips dispatch — the eligible candidate is never claimed"
+        );
+
+        // The skip is operator-visible in the event log as well as daemon state.
+        let contents = std::fs::read_to_string(store_dir.join("log")).unwrap();
+        assert!(
+            contents.contains("event=dispatch_skipped"),
+            "the skipped dispatch must be recorded to the log: {contents}"
+        );
+    }
+
+    // STORY-012 AC2: with a valid on-disk config the per-tick preflight passes and
+    // dispatch proceeds — the eligible candidate is claimed and published Running,
+    // and no dispatch fault is surfaced. The resume contrast to the gated case.
+    #[tokio::test]
+    async fn a_valid_config_dispatches_and_surfaces_no_fault() {
+        let (_repo, config_path, _socket) = init_project("");
+        let (adapter, gate) = blocking_adapter();
+        let mut config = load_str("").unwrap();
+        config.poll_interval_ms = 5;
+        let orch = spawn_orchestrator(&config_path, config, fake_tracker(), adapter);
+
+        wait_for_running(&orch.state).await;
+        {
+            let state = orch.state.lock().unwrap();
+            assert_eq!(
+                state.running[0].id, "ITER-014",
+                "a valid config dispatches the eligible candidate"
+            );
+            assert!(
+                state.dispatch_error.is_none(),
+                "a valid config surfaces no dispatch fault"
+            );
+        }
+
+        drain_and_shutdown(orch, &gate).await;
+    }
+
+    // STORY-012 AC3: a candidate-fetch failure is surfaced (not silently dropped) to
+    // daemon state and the event log, nothing is dispatched, and the worker stays
+    // healthy — the loop keeps ticking, so fetch is retried (it rescheduled).
+    #[tokio::test]
+    async fn a_candidate_fetch_error_is_surfaced_and_nothing_is_dispatched() {
+        let (_repo, config_path, _socket) = init_project("");
+        let store_dir = config_path.parent().unwrap().to_path_buf();
+        let (adapter, gate) = blocking_adapter();
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let tracker = FetchFailingTracker {
+            fetches: fetches.clone(),
+        };
+        let mut config = load_str("").unwrap();
+        config.poll_interval_ms = 5;
+        let orch = spawn_orchestrator(&config_path, config, tracker, adapter);
+
+        let message = wait_for_dispatch_error(&orch.state).await;
+        assert!(
+            message.contains("fetch"),
+            "the surfaced error describes the fetch failure: {message}"
+        );
+
+        // The worker stays healthy: fetch is attempted again on a later tick, proof
+        // the loop rescheduled rather than dying on the error.
+        let before = fetches.load(Ordering::SeqCst);
+        wait_for_fetches(&fetches, before + 2).await;
+        assert!(
+            orch.state.lock().unwrap().running.is_empty(),
+            "a fetch error must dispatch nothing"
+        );
+
+        drain_and_shutdown(orch, &gate).await;
+
+        let store = Store::open(&store_dir.join("store.redb")).unwrap();
+        assert_eq!(
+            store.claims().unwrap().len(),
+            0,
+            "a fetch error dispatches nothing, so no claim exists"
+        );
+
+        // The skip is operator-visible in the event log as well.
+        let contents = std::fs::read_to_string(store_dir.join("log")).unwrap();
+        assert!(
+            contents.contains("event=dispatch_skipped"),
+            "the fetch-error skip must be recorded to the log: {contents}"
+        );
     }
 
     #[tokio::test]
