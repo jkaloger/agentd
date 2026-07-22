@@ -1,7 +1,7 @@
 ---
 title: Surface and recover from gate-rejected transitions
 type: story
-status: draft
+status: review
 author: Jack Kaloger
 date: 2026-07-13
 tags: []

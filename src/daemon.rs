@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -362,6 +363,12 @@ where
             }
         }
 
+        // Gate-rejection suppression (STORY-027, ADR-003): ids lazyspec refused to
+        // advance on a lifecycle gate. In-memory, spanning poll cycles for this
+        // daemon's lifetime — a restart re-evaluates against lazyspec (ADR-002).
+        // Transport advance faults are never inserted, so they stay retryable.
+        let mut suppressed: HashSet<String> = HashSet::new();
+
         loop {
             // Fill free slots (ADR-007/ADR-008): dispatch up to `max_concurrent`
             // minus the live workers, in priority order, spawning a worker per
@@ -401,6 +408,7 @@ where
                     HOLDER,
                     |_| {},
                     at_status_cap,
+                    |id: &str| suppressed.contains(id),
                 ) {
                     DispatchOutcome::Dispatched(dispatch) => {
                         let id = dispatch.candidate.id.clone();
@@ -447,6 +455,15 @@ where
                         });
                     }
                     DispatchOutcome::NoDispatch(report) => {
+                        // A gate refusal suppresses the id for this daemon's
+                        // lifetime so later ticks neither re-claim nor re-log it
+                        // (STORY-027 AC3); a transport skip leaves it retryable.
+                        if let TickReport::Skipped {
+                            id, gate: Some(_), ..
+                        } = &report
+                        {
+                            suppressed.insert(id.clone());
+                        }
                         mirror_nondispatch(report, &projection, &snapshot, &store, now);
                         break;
                     }
@@ -727,26 +744,40 @@ fn mirror_nondispatch(
     now: u64,
 ) {
     match report {
-        TickReport::Skipped { id, claim, .. } => match claim {
-            SkipClaim::ClaimedThenReleased => {
-                projection.record(now, &id, EventKind::Claim, &[("holder", HOLDER)]);
-                projection.record(now, &id, EventKind::Release, &[("holder", HOLDER)]);
-                snapshot.remove_ref(&id);
-                if let Ok(claims) = store.claims() {
-                    snapshot.write_state(&claims);
+        TickReport::Skipped {
+            id, claim, gate, ..
+        } => {
+            match claim {
+                SkipClaim::ClaimedThenReleased => {
+                    projection.record(now, &id, EventKind::Claim, &[("holder", HOLDER)]);
+                    projection.record(now, &id, EventKind::Release, &[("holder", HOLDER)]);
+                    snapshot.remove_ref(&id);
+                    if let Ok(claims) = store.claims() {
+                        snapshot.write_state(&claims);
+                    }
                 }
+                SkipClaim::ClaimedReleaseFailed => {
+                    projection.record(now, &id, EventKind::Claim, &[("holder", HOLDER)]);
+                    if let Ok(Some(held)) = store.get(&id) {
+                        snapshot.set_ref(&id, &held.holder, held.fence);
+                    }
+                    if let Ok(claims) = store.claims() {
+                        snapshot.write_state(&claims);
+                    }
+                }
+                SkipClaim::NotClaimed => {}
             }
-            SkipClaim::ClaimedReleaseFailed => {
-                projection.record(now, &id, EventKind::Claim, &[("holder", HOLDER)]);
-                if let Ok(Some(held)) = store.get(&id) {
-                    snapshot.set_ref(&id, &held.holder, held.fence);
-                }
-                if let Ok(claims) = store.claims() {
-                    snapshot.write_state(&claims);
-                }
+            // STORY-027 AC1: a lifecycle-gate refusal gets one line naming the id,
+            // the rejected transition, and lazyspec's reason.
+            if let Some(gate) = gate {
+                projection.record(
+                    now,
+                    &id,
+                    EventKind::GateRejected,
+                    &[("transition", &gate.transition), ("reason", &gate.reason)],
+                );
             }
-            SkipClaim::NotClaimed => {}
-        },
+        }
         TickReport::Blocked(blocked) => {
             for candidate in blocked {
                 projection.record(
@@ -1075,6 +1106,82 @@ mod tests {
             fetches: fetches.clone(),
         };
         (tracker, fetches)
+    }
+
+    /// A tracker fake that always offers one eligible candidate under a terminal
+    /// parent, but whose advance-to-active fails every time — either as a lazyspec
+    /// gate refusal (`gate: true`) or a transport fault (`gate: false`). Counts its
+    /// advance attempts so a test can prove a gate rejection is claimed at most once
+    /// while a transport fault stays retryable (STORY-027 AC3).
+    struct AdvanceFailingTracker {
+        candidate: Candidate,
+        parent: DocView,
+        gate: bool,
+        advances: Arc<AtomicUsize>,
+        fetches: Arc<AtomicUsize>,
+    }
+
+    impl Tracker for AdvanceFailingTracker {
+        fn fetch_dispatchable(&self) -> Result<Vec<Candidate>, TrackerError> {
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![self.candidate.clone()])
+        }
+
+        fn fetch_doc(&self, _id: &str) -> Result<DocView, TrackerError> {
+            Ok(self.parent.clone())
+        }
+
+        fn lookup_doc(&self, id: &str) -> Result<DocLookup, TrackerError> {
+            if id == self.parent.id {
+                return Ok(DocLookup::Present(self.parent.clone()));
+            }
+            Ok(DocLookup::Present(active_iteration(id)))
+        }
+
+        fn advance(&self, _id: &str, target: &str) -> Result<(), TrackerError> {
+            self.advances.fetch_add(1, Ordering::SeqCst);
+            if self.gate {
+                Err(TrackerError::Gate {
+                    target: target.to_string(),
+                    reason: format!("no edge from \"accepted\" to \"{target}\""),
+                })
+            } else {
+                Err(TrackerError::Command {
+                    code: Some(1),
+                    stderr: "lazyspec status unreadable".to_string(),
+                })
+            }
+        }
+    }
+
+    /// An `AdvanceFailingTracker` plus handles to its advance and fetch counters.
+    fn advance_failing_tracker(gate: bool) -> (AdvanceFailingTracker, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let advances = Arc::new(AtomicUsize::new(0));
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let tracker = AdvanceFailingTracker {
+            candidate: Candidate {
+                id: "ITER-014".to_string(),
+                identifier: "execute-one-iteration".to_string(),
+                title: "Execute one iteration end-to-end".to_string(),
+                body: "Objective: prove the full path.".to_string(),
+                state: "accepted".to_string(),
+                parent: Some("STORY-060".to_string()),
+                dependencies: Vec::new(),
+                priority: None,
+                created_at: "2026-07-13".to_string(),
+            },
+            parent: DocView {
+                id: "STORY-060".to_string(),
+                doc_type: "story".to_string(),
+                title: "Execute one iteration end-to-end".to_string(),
+                body: "As an operator, I want one eligible iteration to flow.".to_string(),
+                status: "complete".to_string(),
+            },
+            gate,
+            advances: advances.clone(),
+            fetches: fetches.clone(),
+        };
+        (tracker, advances, fetches)
     }
 
     /// An adapter fake whose turn blocks on a gate until the test releases it, so
@@ -1530,6 +1637,58 @@ mod tests {
             "the retry carries the run's failure detail"
         );
         assert!(entries[0].1.due_at > 0);
+    }
+
+    async fn wait_for_advances(advances: &Arc<AtomicUsize>, n: usize) {
+        for _ in 0..400 {
+            if advances.load(Ordering::SeqCst) >= n {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("fewer than {n} advances");
+    }
+
+    // STORY-027 AC3: a candidate lazyspec keeps gating out is claimed (advanced)
+    // at most once — after the first refusal the daemon suppresses it, so
+    // continued polls neither re-claim nor re-advance it, and it never busy-loops.
+    #[tokio::test]
+    async fn a_gate_rejected_candidate_is_advanced_at_most_once_across_ticks() {
+        let (_repo, config_path, _socket) = init_project("");
+        let (adapter, gate) = blocking_adapter();
+        let (tracker, advances, fetches) = advance_failing_tracker(true);
+        let mut config = load_str("").unwrap();
+        config.poll_interval_ms = 5;
+        let orch = spawn_orchestrator(&config_path, config, tracker, adapter);
+
+        // Let several poll cycles run (reconcile fetch + one per tick); the first
+        // tick advances-and-is-refused, later ticks must find the id suppressed.
+        wait_for_fetches(&fetches, 4).await;
+        assert_eq!(
+            advances.load(Ordering::SeqCst),
+            1,
+            "a gate-refused item is advanced once, then suppressed for later ticks"
+        );
+
+        drain_all(orch, &gate).await;
+    }
+
+    // STORY-027 AC3 contrast: a transport advance fault must NOT suppress — the
+    // item stays retryable, so successive ticks keep re-claiming and re-advancing it.
+    #[tokio::test]
+    async fn a_transport_advance_error_is_retried_not_suppressed() {
+        let (_repo, config_path, _socket) = init_project("");
+        let (adapter, gate) = blocking_adapter();
+        let (tracker, advances, _fetches) = advance_failing_tracker(false);
+        let mut config = load_str("").unwrap();
+        config.poll_interval_ms = 5;
+        let orch = spawn_orchestrator(&config_path, config, tracker, adapter);
+
+        // A transport fault leaves the id retryable, so the advance is attempted
+        // again on a later tick — the count climbs past one.
+        wait_for_advances(&advances, 2).await;
+
+        drain_all(orch, &gate).await;
     }
 
     // STORY-008 AC1 + Verification: backoff doubles per attempt and a large attempt

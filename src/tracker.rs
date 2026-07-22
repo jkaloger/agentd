@@ -166,8 +166,20 @@ impl<R: CommandRunner> Tracker for LazyspecTracker<R> {
     }
 
     fn advance(&self, id: &str, target_state: &str) -> Result<(), TrackerError> {
-        self.runner.run(&["update", id, "--status", target_state])?;
-        Ok(())
+        match self.runner.run(&["update", id, "--status", target_state]) {
+            Ok(_) => Ok(()),
+            // A non-zero exit whose stderr names a lifecycle-gate refusal is a
+            // gate rejection, not a transport fault — the daemon surfaces and
+            // suppresses it rather than retrying (ADR-003, STORY-027). Anything
+            // else (spawn, other non-zero exit) stays a transport variant.
+            Err(CliFailure::Exit { stderr, .. }) if is_gate_rejection(&stderr) => {
+                Err(TrackerError::Gate {
+                    target: target_state.to_string(),
+                    reason: stderr,
+                })
+            }
+            Err(failure) => Err(failure.into()),
+        }
     }
 }
 
@@ -261,6 +273,13 @@ fn is_not_found(stderr: &str) -> bool {
     stderr.contains("not found")
 }
 
+/// lazyspec prints `invalid transition for type "<t>": no edge from "<a>" to
+/// "<b>"` when an advance is refused by the lifecycle DAG; the leading phrase is
+/// the stable marker that separates a gate refusal from a transport fault.
+fn is_gate_rejection(stderr: &str) -> bool {
+    stderr.contains("invalid transition")
+}
+
 #[derive(Deserialize)]
 struct StatusListing {
     documents: Vec<RawDoc>,
@@ -336,6 +355,11 @@ struct ShownDoc {
 pub enum TrackerError {
     Spawn(io::Error),
     Command { code: Option<i32>, stderr: String },
+    /// A lazyspec lifecycle-gate refusal (ADR-003): the advance to `target` has
+    /// no edge from the document's current state. Kept distinct from a transport
+    /// `Command` fault so the daemon can surface it and suppress the item rather
+    /// than retrying a transition the DAG will keep rejecting (STORY-027).
+    Gate { target: String, reason: String },
     Parse(serde_json::Error),
 }
 
@@ -365,6 +389,9 @@ impl fmt::Display for TrackerError {
                 Some(c) => write!(f, "lazyspec exited {c}: {stderr}"),
                 None => write!(f, "lazyspec terminated: {stderr}"),
             },
+            TrackerError::Gate { target, reason } => {
+                write!(f, "lazyspec gate refused advance to {target}: {reason}")
+            }
             TrackerError::Parse(e) => write!(f, "cannot parse lazyspec JSON: {e}"),
         }
     }
@@ -375,7 +402,7 @@ impl std::error::Error for TrackerError {
         match self {
             TrackerError::Spawn(e) => Some(e),
             TrackerError::Parse(e) => Some(e),
-            TrackerError::Command { .. } => None,
+            TrackerError::Command { .. } | TrackerError::Gate { .. } => None,
         }
     }
 }
@@ -740,6 +767,64 @@ mod tests {
             matches!(err, TrackerError::Command { code: Some(1), .. }),
             "{err}"
         );
+    }
+
+    /// A runner whose `update` (advance) call fails with a chosen exit, to exercise
+    /// the gate-refusal-vs-transport split in `advance`.
+    struct FailingUpdate {
+        failure: CliFailure,
+    }
+
+    impl CommandRunner for FailingUpdate {
+        fn run(&self, _args: &[&str]) -> Result<Vec<u8>, CliFailure> {
+            match &self.failure {
+                CliFailure::Exit { code, stderr } => Err(CliFailure::Exit {
+                    code: *code,
+                    stderr: stderr.clone(),
+                }),
+                CliFailure::Spawn(_) => Err(CliFailure::Spawn(io::Error::other("spawn"))),
+            }
+        }
+    }
+
+    #[test]
+    fn advance_classifies_a_gate_refusal_as_a_gate_error() {
+        let tracker = LazyspecTracker::new(
+            FailingUpdate {
+                failure: CliFailure::Exit {
+                    code: Some(1),
+                    stderr: r#"invalid transition for type "iteration": no edge from "accepted" to "complete" (allowed targets: in-progress, superseded)"#.to_string(),
+                },
+            },
+            RoleMapping::adr003_default(),
+        );
+
+        let err = tracker.advance("ITER-014", "complete").unwrap_err();
+
+        match err {
+            TrackerError::Gate { target, reason } => {
+                assert_eq!(target, "complete");
+                assert!(reason.contains("invalid transition"), "{reason}");
+            }
+            other => panic!("expected a Gate error, got {other}"),
+        }
+    }
+
+    #[test]
+    fn advance_classifies_a_transport_failure_as_a_command_error() {
+        let tracker = LazyspecTracker::new(
+            FailingUpdate {
+                failure: CliFailure::Exit {
+                    code: Some(2),
+                    stderr: "Error: config parse failed".to_string(),
+                },
+            },
+            RoleMapping::adr003_default(),
+        );
+
+        let err = tracker.advance("ITER-014", "complete").unwrap_err();
+
+        assert!(matches!(err, TrackerError::Command { .. }), "{err}");
     }
 
     #[test]

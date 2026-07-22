@@ -134,7 +134,7 @@ mod tests {
                     } else {
                         Err(CliFailure::Exit {
                             code: Some(1),
-                            stderr: "gate rejected".to_string(),
+                            stderr: r#"invalid transition for type "iteration": no edge from "accepted" to "in-progress" (allowed targets: review, superseded)"#.to_string(),
                         })
                     }
                 }
@@ -239,7 +239,10 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(matches!(err, DispatchError::Advance(_)), "{err}");
+        assert!(
+            matches!(err, DispatchError::Advance(TrackerError::Gate { .. })),
+            "a gate refusal must surface as an advance gate error: {err}"
+        );
         assert!(!started, "agent must not start when the advance fails");
         assert_eq!(
             store.get("ITER-008").unwrap(),

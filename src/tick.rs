@@ -35,6 +35,11 @@ pub enum TickReport {
         id: String,
         reason: String,
         claim: SkipClaim,
+        /// Present only when the skip was a lazyspec gate refusal (STORY-027): the
+        /// rejected transition and lazyspec's stated reason. A lost claim or a
+        /// transport advance fault leaves this `None`, so the daemon logs and
+        /// suppresses gate refusals while transport faults stay retryable.
+        gate: Option<GateRejection>,
     },
     /// Candidates were dispatch-eligible by role but every one was held back by
     /// the blocker gate — a `blocked-by` dependency or the parent work item is
@@ -50,6 +55,15 @@ pub enum TickReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockedCandidate {
     pub id: String,
+    pub reason: String,
+}
+
+/// A lazyspec lifecycle-gate refusal of a claim's advance-to-active (STORY-027):
+/// the rejected transition (the claim target) and lazyspec's stated reason,
+/// carried on a `Skipped` report so the daemon can log it and suppress the item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateRejection {
+    pub transition: String,
     pub reason: String,
 }
 
@@ -253,7 +267,14 @@ pub struct WorkerCompletion {
 /// left for a future tick — so an uncapped status is never starved by a capped one.
 /// The daemon tallies its live-worker registry to answer; the inline path passes a
 /// predicate that never caps.
-pub fn dispatch_one<T, R, S>(
+///
+/// `is_suppressed` is the gate-rejection skip set (STORY-027, ADR-003): a candidate
+/// whose id it reports is passed over exactly like a live-claimed one — never
+/// claimed, never advanced — so an item lazyspec keeps gating out does not busy-loop
+/// each poll. The daemon feeds its in-memory suppressed set; the inline path passes
+/// a predicate that never suppresses.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_one<T, R, S, P>(
     tracker: &T,
     store: &Store,
     config: &Config,
@@ -261,11 +282,13 @@ pub fn dispatch_one<T, R, S>(
     holder: &str,
     on_activated: R,
     at_status_cap: S,
+    is_suppressed: P,
 ) -> DispatchOutcome
 where
     T: Tracker,
     R: FnOnce(&Candidate),
     S: Fn(&str) -> bool,
+    P: Fn(&str) -> bool,
 {
     let mut candidates = match tracker.fetch_dispatchable() {
         Ok(candidates) => candidates,
@@ -285,6 +308,11 @@ where
     let mut selected = None;
     for candidate in candidates {
         if has_live_claim(store, &candidate.id, now) {
+            continue;
+        }
+        // Gate-rejection suppression (STORY-027): an item lazyspec keeps gating out
+        // is passed over so continued polls neither re-claim nor re-log it.
+        if is_suppressed(&candidate.id) {
             continue;
         }
         // Per-status cap (STORY-006): pass over — but do not claim — a candidate
@@ -335,10 +363,22 @@ where
                 DispatchError::Advance(_) => SkipClaim::ClaimedThenReleased,
                 DispatchError::Release(_) => SkipClaim::ClaimedReleaseFailed,
             };
+            // Only a lifecycle-gate refusal carries a transition + reason (and is
+            // suppressed downstream); a transport advance fault stays retryable.
+            let gate = match &e {
+                DispatchError::Advance(TrackerError::Gate { target, reason }) => {
+                    Some(GateRejection {
+                        transition: target.clone(),
+                        reason: reason.clone(),
+                    })
+                }
+                _ => None,
+            };
             return DispatchOutcome::NoDispatch(TickReport::Skipped {
                 id: candidate.id,
                 reason: e.to_string(),
                 claim,
+                gate,
             });
         }
     };
@@ -496,8 +536,16 @@ where
     A: AgentAdapter,
     R: FnOnce(&Candidate),
 {
-    let dispatch = match dispatch_one(tracker, store, config, now, holder, on_activated, |_| false)
-    {
+    let dispatch = match dispatch_one(
+        tracker,
+        store,
+        config,
+        now,
+        holder,
+        on_activated,
+        |_| false,
+        |_| false,
+    ) {
         DispatchOutcome::Dispatched(dispatch) => dispatch,
         DispatchOutcome::NoDispatch(report) => return report,
     };
@@ -1125,9 +1173,9 @@ mod tests {
                 .unwrap()
                 .push((id.to_string(), target.to_string()));
             if self.fail_advance {
-                return Err(TrackerError::Command {
-                    code: Some(1),
-                    stderr: "gate rejected".to_string(),
+                return Err(TrackerError::Gate {
+                    target: target.to_string(),
+                    reason: format!("no edge from \"accepted\" to \"{target}\""),
                 });
             }
             if self.drop_after_claim {
@@ -2014,16 +2062,21 @@ mod tests {
         )
         .await;
 
-        assert!(
-            matches!(
-                report,
-                TickReport::Skipped {
-                    claim: SkipClaim::ClaimedThenReleased,
-                    ..
-                }
+        let gate = match report {
+            TickReport::Skipped {
+                claim: SkipClaim::ClaimedThenReleased,
+                gate,
+                ..
+            } => gate,
+            other => panic!(
+                "a gated-out advance must report the claim was committed then released: {other:?}"
             ),
-            "a gated-out advance must report that the claim was committed then released: {report:?}"
-        );
+        };
+        // STORY-027 AC1: the skip carries the rejected transition and lazyspec's
+        // reason, so the daemon can log the stuck item and suppress it.
+        let gate = gate.expect("a gate refusal must carry its transition and reason");
+        assert_eq!(gate.transition, "in-progress");
+        assert!(gate.reason.contains("no edge"), "{}", gate.reason);
         assert_eq!(
             store.get("ITER-014").unwrap(),
             None,

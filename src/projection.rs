@@ -30,6 +30,11 @@ pub enum EventKind {
     /// `blocked-by` dependency or parent is not yet terminal-complete. Recorded so
     /// the reason is durable and offline-inspectable; no store change backs it.
     Blocked,
+    /// A claim whose advance-to-active lazyspec refused on a lifecycle gate
+    /// (STORY-027, ADR-003): recorded with the rejected transition and lazyspec's
+    /// reason so the stuck item is offline-inspectable. The claim was released, so
+    /// a `Release` line accompanies it; no additional store change backs this line.
+    GateRejected,
 }
 
 impl fmt::Display for EventKind {
@@ -43,6 +48,7 @@ impl fmt::Display for EventKind {
             EventKind::RetryScheduled => "retry_scheduled",
             EventKind::RetryCleared => "retry_cleared",
             EventKind::Blocked => "blocked",
+            EventKind::GateRejected => "gate_rejected",
         };
         write!(f, "{s}")
     }
@@ -249,6 +255,34 @@ mod tests {
         assert_eq!(scheduled["due_at"], "9000");
 
         assert_eq!(parse_line(lines[1])["event"], "retry_cleared");
+    }
+
+    #[test]
+    fn a_gate_rejection_projects_one_line_with_the_transition_and_reason() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("log");
+        let projection = Projection::new(&path);
+
+        projection.record(
+            1000,
+            "ITER-014",
+            EventKind::GateRejected,
+            &[
+                ("transition", "in-progress"),
+                ("reason", "no edge from accepted to in-progress"),
+            ],
+        );
+
+        let contents = fs::read_to_string(&path).unwrap();
+        assert_eq!(contents.lines().count(), 1);
+        assert!(contents.contains("iter=ITER-014"), "{contents}");
+        assert!(contents.contains("event=gate_rejected"), "{contents}");
+        assert!(contents.contains("transition=in-progress"), "{contents}");
+        assert!(
+            contents.contains("reason=no edge from accepted to in-progress"),
+            "{contents}"
+        );
+        assert!(contents.ends_with('\n'));
     }
 
     #[cfg(unix)]
