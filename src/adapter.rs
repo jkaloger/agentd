@@ -16,10 +16,14 @@ pub trait AgentAdapter {
 
     fn start_session(&self, worktree: Worktree) -> Self::Session;
 
+    /// `on_progress` fires once per streamed agent event so the orchestrator can
+    /// track liveness mid-turn (STORY-011): the only mid-flight signal a batched
+    /// turn report otherwise withholds until the turn ends.
     fn run_turn(
         &self,
         session: &Self::Session,
         prompt: &str,
+        on_progress: &(dyn Fn() + Send + Sync),
     ) -> impl std::future::Future<Output = TurnReport> + Send;
 
     fn stop(&self, session: Self::Session) -> impl std::future::Future<Output = ()> + Send;
@@ -89,7 +93,12 @@ impl AgentAdapter for ClaudeAdapter {
         ClaudeSession { worktree }
     }
 
-    async fn run_turn(&self, session: &ClaudeSession, prompt: &str) -> TurnReport {
+    async fn run_turn(
+        &self,
+        session: &ClaudeSession,
+        prompt: &str,
+        on_progress: &(dyn Fn() + Send + Sync),
+    ) -> TurnReport {
         let mut child = match Command::new(&self.program)
             .args(&self.base_args)
             .current_dir(&session.worktree.path)
@@ -126,6 +135,7 @@ impl AgentAdapter for ClaudeAdapter {
         if let Some(stdout) = child.stdout.take() {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
+                on_progress();
                 match agent::map_line(&line, pid, now_ms()) {
                     AgentEvent::TurnCompleted { .. } => success_result = true,
                     AgentEvent::TurnFailed { reason, .. } => result_error = Some(reason),
@@ -240,10 +250,12 @@ mod tests {
 
     async fn run(adapter: &ClaudeAdapter, wt: Worktree, prompt: &str) -> TurnReport {
         let session = adapter.start_session(wt);
-        let report =
-            tokio::time::timeout(Duration::from_secs(10), adapter.run_turn(&session, prompt))
-                .await
-                .expect("run_turn hung");
+        let report = tokio::time::timeout(
+            Duration::from_secs(10),
+            adapter.run_turn(&session, prompt, &|| {}),
+        )
+        .await
+        .expect("run_turn hung");
         adapter.stop(session).await;
         report
     }

@@ -13,6 +13,12 @@ poll_interval_ms = 5000
 # further eligible work waits. Freeing a slot re-evaluates the whole eligible set.
 max_concurrent = 2
 
+# How long a running agent may go without producing an event before the daemon
+# treats it as stalled: it kills the worker and queues a retry. Measured in
+# milliseconds from the last agent event (or dispatch, if none yet). Set to 0 or
+# any non-positive value to disable stall detection entirely.
+stall_timeout_ms = 300000
+
 [agent]
 # Which agent adapter to drive. Adapter order is claude -> codex -> opencode.
 kind = "claude"

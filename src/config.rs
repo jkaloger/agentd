@@ -8,6 +8,7 @@ use serde::Deserialize;
 const DEFAULT_POLL_INTERVAL_MS: u64 = 5000;
 const DEFAULT_MAX_RETRY_BACKOFF_MS: u64 = 3_600_000;
 const DEFAULT_MAX_CONCURRENT: u32 = 2;
+const DEFAULT_STALL_TIMEOUT_MS: i64 = 300_000;
 const DEFAULT_MAX_TURNS: u32 = 1;
 const DEFAULT_AUTO_APPROVE: bool = true;
 const DEFAULT_WORKSPACE_ROOT: &str = ".agentd/workspaces";
@@ -47,6 +48,9 @@ pub struct Config {
     /// failed item's next attempt is due `min(10000 * 2^(attempt-1), this)` ms out.
     pub max_retry_backoff_ms: u64,
     pub max_concurrent: u32,
+    /// How long a running worker may go without an agent event before it is
+    /// treated as stalled and killed+retried. `<= 0` disables stall detection.
+    pub stall_timeout_ms: i64,
     pub agent: Agent,
     pub workspace: Workspace,
     pub dispatch: Dispatch,
@@ -151,6 +155,8 @@ fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
     let max_concurrent = raw.max_concurrent.unwrap_or(DEFAULT_MAX_CONCURRENT);
     require_positive("max_concurrent", max_concurrent as u64)?;
 
+    let stall_timeout_ms = raw.stall_timeout_ms.unwrap_or(DEFAULT_STALL_TIMEOUT_MS);
+
     let max_turns = raw.agent.max_turns.unwrap_or(DEFAULT_MAX_TURNS);
     require_positive("agent.max_turns", max_turns as u64)?;
     let agent = Agent {
@@ -219,6 +225,7 @@ fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
         poll_interval_ms,
         max_retry_backoff_ms,
         max_concurrent,
+        stall_timeout_ms,
         agent,
         workspace,
         dispatch,
@@ -273,6 +280,7 @@ struct RawConfig {
     poll_interval_ms: Option<u64>,
     max_retry_backoff_ms: Option<u64>,
     max_concurrent: Option<u32>,
+    stall_timeout_ms: Option<i64>,
     #[serde(default)]
     agent: RawAgent,
     #[serde(default)]
@@ -337,6 +345,7 @@ mod tests {
         assert_eq!(config.poll_interval_ms, 5000);
         assert_eq!(config.max_retry_backoff_ms, 3_600_000);
         assert_eq!(config.max_concurrent, 2);
+        assert_eq!(config.stall_timeout_ms, 300_000);
         assert_eq!(config.agent.kind, AgentKind::Claude);
         assert_eq!(config.agent.max_turns, 1);
         assert!(config.agent.auto_approve);
@@ -383,6 +392,21 @@ kind = "codex"
     fn max_retry_backoff_override_is_honoured() {
         let config = load_str("max_retry_backoff_ms = 60000").unwrap();
         assert_eq!(config.max_retry_backoff_ms, 60000);
+    }
+
+    #[test]
+    fn non_positive_stall_timeout_is_accepted_as_disabled() {
+        assert_eq!(load_str("stall_timeout_ms = 0").unwrap().stall_timeout_ms, 0);
+        assert_eq!(
+            load_str("stall_timeout_ms = -1").unwrap().stall_timeout_ms,
+            -1
+        );
+    }
+
+    #[test]
+    fn stall_timeout_override_is_honoured() {
+        let config = load_str("stall_timeout_ms = 60000").unwrap();
+        assert_eq!(config.stall_timeout_ms, 60000);
     }
 
     #[test]
@@ -466,6 +490,7 @@ whatever = 1
 
         assert_eq!(config.poll_interval_ms, 5000);
         assert_eq!(config.max_concurrent, 2);
+        assert_eq!(config.stall_timeout_ms, 300_000);
         assert_eq!(config.agent.kind, AgentKind::Claude);
         assert_eq!(config.agent.max_turns, 1);
         assert_eq!(config.workspace.mode, WorkspaceMode::Worktree);

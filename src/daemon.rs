@@ -17,7 +17,7 @@ use crate::projection::{EventKind, Projection, Snapshot};
 use crate::prompt;
 use crate::store::Store;
 use crate::tick::{
-    DispatchOutcome, RunRecord, RunningAction, SkipClaim, TickReport, WorkerCompletion,
+    DispatchOutcome, RunRecord, RunningAction, RunningView, SkipClaim, TickReport, WorkerCompletion,
     dispatch_one, finalize, reconcile, reconcile_running, run_worker,
 };
 use crate::tracker::Tracker;
@@ -95,6 +95,12 @@ struct RunningItem {
     /// The stop handle for the in-flight turn: aborting it terminates the worker
     /// (the orchestrator, not the agent, decides to stop — ADR-001).
     handle: JoinHandle<()>,
+    /// When this worker's last agent event arrived (STORY-011): `None` until the
+    /// first streamed event. The stall check measures elapsed from here, falling
+    /// back to `started_at_ms`.
+    last_event_at_ms: Option<u64>,
+    /// Which attempt this run is (carried onto a stall retry, STORY-011).
+    attempt: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -327,6 +333,7 @@ where
         let projection = Projection::new(log_path);
         let snapshot = Snapshot::new(store_dir);
         let (completion_tx, mut completion_rx) = mpsc::unbounded_channel::<WorkerCompletion>();
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<(String, u64)>();
 
         {
             let config = config_rx.borrow().clone();
@@ -398,6 +405,7 @@ where
                     DispatchOutcome::Dispatched(dispatch) => {
                         let id = dispatch.candidate.id.clone();
                         let identifier = dispatch.candidate.identifier.clone();
+                        let attempt = dispatch.attempt;
                         let started_at_ms = now_ms();
                         // The worktree `run_worker` will prepare for this run
                         // (ADR-005): its deterministic path, held so a terminal
@@ -409,7 +417,12 @@ where
                         let worker_template = template.clone();
                         let worker_repo = repo.clone();
                         let tx = completion_tx.clone();
+                        let progress = progress_tx.clone();
+                        let progress_id = id.clone();
                         let handle = tokio::spawn(async move {
+                            let on_progress = move || {
+                                let _ = progress.send((progress_id.clone(), now_ms()));
+                            };
                             let completion = run_worker(
                                 worker_tracker.as_ref(),
                                 worker_adapter.as_ref(),
@@ -417,6 +430,7 @@ where
                                 &worker_template,
                                 &worker_repo,
                                 dispatch,
+                                &on_progress,
                             )
                             .await;
                             let _ = tx.send(completion);
@@ -428,6 +442,8 @@ where
                             started_at_ms,
                             worktree,
                             handle,
+                            last_event_at_ms: None,
+                            attempt,
                         });
                     }
                     DispatchOutcome::NoDispatch(report) => {
@@ -451,6 +467,7 @@ where
                 &worker_state,
                 &repo,
                 now,
+                config.stall_timeout_ms,
             );
 
             // Re-read the interval fresh so a reload governs the next wait only
@@ -469,6 +486,12 @@ where
                         &worker_state,
                         config.max_retry_backoff_ms,
                     );
+                }
+                Some((id, at_ms)) = progress_rx.recv() => {
+                    let mut st = worker_state.lock().unwrap();
+                    if let Some(item) = st.running.iter_mut().find(|i| i.id == id) {
+                        item.last_event_at_ms = Some(at_ms);
+                    }
                 }
                 _ = tokio::time::sleep(Duration::from_millis(interval)) => {}
             }
@@ -600,17 +623,27 @@ fn reconcile_running_workers<T: Tracker>(
     state: &SharedState,
     repo: &Path,
     now: u64,
+    stall_timeout_ms: i64,
 ) {
-    let ids: Vec<String> = {
+    let views: Vec<RunningView> = {
         let state = state.lock().unwrap();
-        state.running.iter().map(|item| item.id.clone()).collect()
+        state
+            .running
+            .iter()
+            .map(|item| RunningView {
+                id: item.id.clone(),
+                started_at_ms: item.started_at_ms,
+                last_event_at_ms: item.last_event_at_ms,
+                attempt: item.attempt,
+            })
+            .collect()
     };
-    if ids.is_empty() {
+    if views.is_empty() {
         return;
     }
 
     // AC4: a refresh failure leaves every worker running; retry next tick.
-    let Ok(decisions) = reconcile_running(tracker, mapping, &ids) else {
+    let Ok(decisions) = reconcile_running(tracker, mapping, now, stall_timeout_ms, &views) else {
         return;
     };
 
@@ -644,6 +677,23 @@ fn reconcile_running_workers<T: Tracker>(
                 stop_running(state, &id);
                 let _ = store.release(&id);
                 projection.record(now, &id, EventKind::ReconcileRelease, &[]);
+                snapshot.remove_ref(&id);
+                mutated = true;
+            }
+            // STORY-011 AC1: no progress within stall_timeout_ms. Stop the worker
+            // (freeing the slot), release its claim, and queue a retry due now,
+            // carrying the attempt. The tree is left on disk for inspection.
+            RunningAction::TerminateAndRetry { attempt } => {
+                stop_running(state, &id);
+                let _ = store.release(&id);
+                let _ = store.schedule_retry(&id, attempt, "stalled", now);
+                let attempt_str = attempt.to_string();
+                projection.record(
+                    now,
+                    &id,
+                    EventKind::RetryScheduled,
+                    &[("attempt", attempt_str.as_str()), ("reason", "stalled")],
+                );
                 snapshot.remove_ref(&id);
                 mutated = true;
             }
@@ -1040,7 +1090,13 @@ mod tests {
             worktree
         }
 
-        async fn run_turn(&self, _session: &Worktree, _prompt: &str) -> TurnReport {
+        async fn run_turn(
+            &self,
+            _session: &Worktree,
+            _prompt: &str,
+            on_progress: &(dyn Fn() + Send + Sync),
+        ) -> TurnReport {
+            on_progress();
             self.gate.notified().await;
             TurnReport {
                 outcome: TurnOutcome::Completed,
@@ -1145,7 +1201,12 @@ mod tests {
             worktree
         }
 
-        async fn run_turn(&self, _session: &Worktree, _prompt: &str) -> TurnReport {
+        async fn run_turn(
+            &self,
+            _session: &Worktree,
+            _prompt: &str,
+            _on_progress: &(dyn Fn() + Send + Sync),
+        ) -> TurnReport {
             self.gate.notified().await;
             TurnReport {
                 outcome: TurnOutcome::Failed {
@@ -2183,6 +2244,8 @@ max_concurrent = 5
             started_at_ms: now_ms(),
             worktree,
             handle: tokio::spawn(std::future::pending::<()>()),
+            last_event_at_ms: None,
+            attempt: 1,
         }
     }
 
@@ -2231,6 +2294,7 @@ max_concurrent = 5
             &state,
             repo.path(),
             now_ms(),
+            0,
         );
 
         assert!(
@@ -2284,6 +2348,7 @@ max_concurrent = 5
             &state,
             repo.path(),
             now_ms(),
+            0,
         );
 
         assert_eq!(
@@ -2348,6 +2413,7 @@ max_concurrent = 5
             &state,
             repo.path(),
             now_ms(),
+            0,
         );
 
         assert!(
@@ -2405,6 +2471,7 @@ max_concurrent = 5
             &state,
             repo.path(),
             now_ms(),
+            0,
         );
 
         assert_eq!(
@@ -2419,6 +2486,181 @@ max_concurrent = 5
         );
 
         abort_remaining(&state);
+    }
+
+    // STORY-011 AC1 + ordering: a stalled worker whose doc is still active is
+    // terminated, its claim released, and a retry queued due now — the stall pass
+    // wins over the status refresh that would otherwise retain it (AC3).
+    #[tokio::test]
+    async fn reconcile_running_workers_terminates_a_stalled_worker_and_queues_a_retry_at_now() {
+        let (repo, config_path, _socket) = init_project("");
+        let store_dir = config_path.parent().unwrap().to_path_buf();
+        let store = Store::open(&store_dir.join("store.redb")).unwrap();
+        let projection = Projection::new(store_dir.join("log"));
+        let snapshot = Snapshot::new(store_dir.clone());
+        let root = repo.path().join("workspaces");
+        let wt = crate::workspace::prepare_worktree(repo.path(), &root, "ITER-600", None).unwrap();
+        let now = 1_000_000u64;
+        store
+            .claim("ITER-600", HOLDER, now, crate::tick::DEFAULT_LEASE_TTL)
+            .unwrap();
+
+        let state: SharedState = Arc::new(Mutex::new(DaemonState::default()));
+        state.lock().unwrap().running.push(RunningItem {
+            id: "ITER-600".to_string(),
+            identifier: "iter-600".to_string(),
+            state: "in-progress".to_string(),
+            started_at_ms: 1_000, // long before `now`
+            worktree: wt.path.clone(),
+            handle: tokio::spawn(std::future::pending::<()>()),
+            last_event_at_ms: None,
+            attempt: 3,
+        });
+
+        // The doc is STILL ACTIVE, so the status refresh would Retain it — the stall
+        // pass must win (AC3 ordering).
+        let tracker = ReconcileTracker {
+            lookups: std::collections::HashMap::from([(
+                "ITER-600".to_string(),
+                iteration_lookup("ITER-600", "in-progress"),
+            )]),
+            fail: false,
+        };
+
+        reconcile_running_workers(
+            &tracker,
+            &RoleMapping::from_config(&load_str("").unwrap()),
+            &store,
+            &projection,
+            &snapshot,
+            &state,
+            repo.path(),
+            now,
+            100, // stall_timeout_ms; elapsed (now-1000) >> 100
+        );
+
+        assert!(
+            state.lock().unwrap().running.is_empty(),
+            "a stalled worker must be stopped"
+        );
+        assert_eq!(
+            store.get("ITER-600").unwrap(),
+            None,
+            "its claim must be released"
+        );
+        let retries = store.retries().unwrap();
+        let (_, retry) = retries
+            .iter()
+            .find(|(id, _)| id == "ITER-600")
+            .expect("a retry must be queued");
+        assert_eq!(retry.attempt, 3, "the attempt carries through unchanged");
+        assert_eq!(retry.error, "stalled");
+        assert_eq!(retry.due_at, now, "the stall retry is due now");
+    }
+
+    // STORY-011 AC2: a non-positive stall timeout skips the stall pass — the same
+    // stalled timing over an active doc is retained, with no retry queued and its
+    // claim intact.
+    #[tokio::test]
+    async fn reconcile_running_workers_skips_the_stall_pass_when_timeout_is_non_positive() {
+        let (repo, config_path, _socket) = init_project("");
+        let store_dir = config_path.parent().unwrap().to_path_buf();
+        let store = Store::open(&store_dir.join("store.redb")).unwrap();
+        let projection = Projection::new(store_dir.join("log"));
+        let snapshot = Snapshot::new(store_dir.clone());
+        let root = repo.path().join("workspaces");
+        let wt = crate::workspace::prepare_worktree(repo.path(), &root, "ITER-601", None).unwrap();
+        let now = 1_000_000u64;
+        store
+            .claim("ITER-601", HOLDER, now, crate::tick::DEFAULT_LEASE_TTL)
+            .unwrap();
+
+        let state: SharedState = Arc::new(Mutex::new(DaemonState::default()));
+        state.lock().unwrap().running.push(RunningItem {
+            id: "ITER-601".to_string(),
+            identifier: "iter-601".to_string(),
+            state: "in-progress".to_string(),
+            started_at_ms: 1_000,
+            worktree: wt.path.clone(),
+            handle: tokio::spawn(std::future::pending::<()>()),
+            last_event_at_ms: None,
+            attempt: 3,
+        });
+
+        let tracker = ReconcileTracker {
+            lookups: std::collections::HashMap::from([(
+                "ITER-601".to_string(),
+                iteration_lookup("ITER-601", "in-progress"),
+            )]),
+            fail: false,
+        };
+
+        reconcile_running_workers(
+            &tracker,
+            &RoleMapping::from_config(&load_str("").unwrap()),
+            &store,
+            &projection,
+            &snapshot,
+            &state,
+            repo.path(),
+            now,
+            0,
+        );
+
+        assert_eq!(
+            state.lock().unwrap().running.len(),
+            1,
+            "a disabled stall pass must leave the worker running"
+        );
+        assert!(
+            store
+                .retries()
+                .unwrap()
+                .iter()
+                .all(|(id, _)| id != "ITER-601"),
+            "no retry may be queued when the stall pass is disabled"
+        );
+        assert!(
+            store.get("ITER-601").unwrap().is_some(),
+            "the claim must be intact when the stall pass is disabled"
+        );
+
+        abort_remaining(&state);
+    }
+
+    // STORY-011 (streaming seam): a live worker's `last_event_at_ms` is refreshed
+    // from the progress stream the adapter pings each streamed agent event.
+    #[tokio::test]
+    async fn a_running_workers_last_event_is_refreshed_from_the_progress_stream() {
+        let (_repo, config_path, _socket) = init_project("");
+        let (adapter, gate) = blocking_adapter(); // pings on_progress at turn start
+        let (tracker, _fetches) = multi_tracker(1);
+        let mut config = load_str("").unwrap();
+        config.poll_interval_ms = 5;
+        let orch = spawn_orchestrator(&config_path, config, tracker, adapter);
+
+        wait_for_running(&orch.state).await;
+        let mut refreshed = false;
+        for _ in 0..400 {
+            if orch
+                .state
+                .lock()
+                .unwrap()
+                .running
+                .iter()
+                .any(|i| i.last_event_at_ms.is_some())
+            {
+                refreshed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            refreshed,
+            "the worker's last_event_at_ms must be refreshed from the progress stream"
+        );
+
+        drain_all(orch, &gate).await;
     }
 
     #[tokio::test]

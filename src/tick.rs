@@ -371,6 +371,7 @@ pub async fn run_worker<T, A>(
     template_src: &str,
     repo: &Path,
     dispatch: Dispatch,
+    on_progress: &(dyn Fn() + Send + Sync),
 ) -> WorkerCompletion
 where
     T: Tracker,
@@ -419,7 +420,7 @@ where
     };
 
     let session = adapter.start_session(worktree.clone());
-    let report = adapter.run_turn(&session, &prompt).await;
+    let report = adapter.run_turn(&session, &prompt, on_progress).await;
     adapter.stop(session).await;
     let ended_at_ms = now_ms();
 
@@ -500,7 +501,8 @@ where
         DispatchOutcome::Dispatched(dispatch) => dispatch,
         DispatchOutcome::NoDispatch(report) => return report,
     };
-    let completion = run_worker(tracker, adapter, config, template_src, repo, dispatch).await;
+    let completion =
+        run_worker(tracker, adapter, config, template_src, repo, dispatch, &|| {}).await;
     TickReport::Dispatched(Box::new(finalize(store, completion)))
 }
 
@@ -625,7 +627,8 @@ where
             claimed_at_ms: now,
             attempt: record.attempt,
         };
-        let completion = run_worker(tracker, adapter, config, template_src, repo, dispatch).await;
+        let completion =
+            run_worker(tracker, adapter, config, template_src, repo, dispatch, &|| {}).await;
         finalize(store, completion);
         store.clear_retry(&id).map_err(RetryFireError::Store)?;
         outcomes.push(RetryFire::Redispatched(id));
@@ -887,6 +890,16 @@ pub fn reconcile<T: Tracker, W: WorktreeLister>(
     })
 }
 
+/// A live worker's timing snapshot for the stall check (STORY-011): when it
+/// started, when its last agent event arrived (`None` until the first), and
+/// which attempt it is (carried onto the stall retry).
+pub struct RunningView {
+    pub id: String,
+    pub started_at_ms: u64,
+    pub last_event_at_ms: Option<u64>,
+    pub attempt: u32,
+}
+
 /// What reconcile_running decided for one live worker, refreshed against its
 /// current lazyspec state (STORY-010). The daemon applies each against the
 /// single-owner store/projection/snapshot.
@@ -900,14 +913,23 @@ pub enum RunningAction {
     /// state, or lazyspec no longer has the doc: stop the worker and free the
     /// slot, but leave its workspace on disk (AC3).
     TerminateKeepTree,
+    /// The worker produced no agent event within `stall_timeout_ms` (STORY-011
+    /// AC1): stop it and queue a retry (due now), carrying its attempt.
+    TerminateAndRetry { attempt: u32 },
 }
 
 /// Reconcile the daemon's live in-flight workers against refreshed lazyspec
 /// state (STORY-010) — the running-worker counterpart to `reconcile`'s pass over
 /// persisted claims.
 ///
-/// Every running id is looked up first, before any decision is emitted, so a
-/// single `lookup_doc` failure aborts the whole pass with `Err` and the daemon
+/// A stall pass runs first (STORY-011): any worker with no agent event within
+/// `stall_timeout_ms` (measured from `last_event_at_ms`, falling back to
+/// `started_at_ms`) is terminated and retried before its status is ever refreshed,
+/// so a stalled-but-still-active worker is retried rather than retained (AC3). A
+/// non-positive timeout disables the pass entirely (AC2).
+///
+/// Every surviving running id is looked up first, before any decision is emitted,
+/// so a single `lookup_doc` failure aborts the whole pass with `Err` and the daemon
 /// takes no action — every worker keeps running and it retries next tick (AC4).
 /// This mirrors `reconcile`'s read-before-write ordering.
 ///
@@ -920,34 +942,53 @@ pub enum RunningAction {
 pub fn reconcile_running<T: Tracker>(
     tracker: &T,
     mapping: &RoleMapping,
-    running_ids: &[String],
+    now: u64,
+    stall_timeout_ms: i64,
+    running: &[RunningView],
 ) -> Result<Vec<(String, RunningAction)>, TrackerError> {
-    // Refresh every running id before deciding anything, so one read failure
-    // leaves every worker running (AC4).
-    let mut lookups = Vec::with_capacity(running_ids.len());
-    for id in running_ids {
-        let lookup = tracker.lookup_doc(id)?;
-        lookups.push((id.clone(), lookup));
+    let mut decisions = Vec::with_capacity(running.len());
+    // Stall pass first (AC3): a worker with no progress within the timeout is
+    // terminated and retried regardless of its refreshed status, so it never
+    // reaches the status refresh below. A non-positive timeout disables it (AC2).
+    let mut to_refresh: Vec<&RunningView> = Vec::new();
+    for item in running {
+        if stall_timeout_ms > 0 {
+            let last = item.last_event_at_ms.unwrap_or(item.started_at_ms);
+            let elapsed = now.saturating_sub(last);
+            if elapsed > stall_timeout_ms as u64 {
+                decisions.push((
+                    item.id.clone(),
+                    RunningAction::TerminateAndRetry {
+                        attempt: item.attempt,
+                    },
+                ));
+                continue;
+            }
+        }
+        to_refresh.push(item);
     }
-
-    let decisions = lookups
-        .into_iter()
-        .map(|(id, lookup)| {
-            let action = match lookup {
-                DocLookup::Present(view) => match mapping.classify(&view.doc_type, &view.status) {
-                    Some(StateRole::Terminal) => RunningAction::TerminateAndClean,
-                    Some(StateRole::Active) => RunningAction::Retain,
-                    // Dispatch-role or an unmapped state: no longer active, not
-                    // terminal — stop it, but leave the tree (AC3).
-                    Some(StateRole::Dispatch) | None => RunningAction::TerminateKeepTree,
-                },
-                // lazyspec no longer has the doc: the work is gone, so stop the
-                // worker; its tree is not a terminal artifact, so it is left (AC3).
-                DocLookup::Absent => RunningAction::TerminateKeepTree,
-            };
-            (id, action)
-        })
-        .collect();
+    // Status refresh for the survivors (STORY-010): read every id first, so one
+    // lookup failure aborts the pass and leaves those workers running (AC4).
+    let mut lookups = Vec::with_capacity(to_refresh.len());
+    for item in &to_refresh {
+        let lookup = tracker.lookup_doc(&item.id)?;
+        lookups.push((item.id.clone(), lookup));
+    }
+    for (id, lookup) in lookups {
+        let action = match lookup {
+            DocLookup::Present(view) => match mapping.classify(&view.doc_type, &view.status) {
+                Some(StateRole::Terminal) => RunningAction::TerminateAndClean,
+                Some(StateRole::Active) => RunningAction::Retain,
+                // Dispatch-role or an unmapped state: no longer active, not
+                // terminal — stop it, but leave the tree (AC3).
+                Some(StateRole::Dispatch) | None => RunningAction::TerminateKeepTree,
+            },
+            // lazyspec no longer has the doc: the work is gone, so stop the
+            // worker; its tree is not a terminal artifact, so it is left (AC3).
+            DocLookup::Absent => RunningAction::TerminateKeepTree,
+        };
+        decisions.push((id, action));
+    }
     Ok(decisions)
 }
 
@@ -1123,7 +1164,12 @@ mod tests {
             worktree
         }
 
-        async fn run_turn(&self, session: &Worktree, prompt: &str) -> TurnReport {
+        async fn run_turn(
+            &self,
+            session: &Worktree,
+            prompt: &str,
+            _on_progress: &(dyn Fn() + Send + Sync),
+        ) -> TurnReport {
             *self.ran.lock().unwrap() = Some((session.path.clone(), prompt.to_string()));
             self.report.clone()
         }
@@ -1605,6 +1651,17 @@ mod tests {
             body: String::new(),
             status: status.to_string(),
         })
+    }
+
+    fn running_views(ids: &[&str]) -> Vec<RunningView> {
+        ids.iter()
+            .map(|id| RunningView {
+                id: id.to_string(),
+                started_at_ms: NOW,
+                last_event_at_ms: None,
+                attempt: 1,
+            })
+            .collect()
     }
 
     fn tracker_with_lookups(lookups: HashMap<String, DocLookup>) -> FakeTracker {
@@ -2441,7 +2498,9 @@ mod tests {
         let decisions = reconcile_running(
             &tracker,
             &RoleMapping::adr003_default(),
-            &["ITER-014".to_string()],
+            NOW,
+            0,
+            &running_views(&["ITER-014"]),
         )
         .unwrap();
 
@@ -2462,7 +2521,9 @@ mod tests {
         let decisions = reconcile_running(
             &tracker,
             &RoleMapping::adr003_default(),
-            &["ITER-014".to_string()],
+            NOW,
+            0,
+            &running_views(&["ITER-014"]),
         )
         .unwrap();
 
@@ -2479,14 +2540,14 @@ mod tests {
             ("ITER-b".to_string(), iteration_doc("ITER-b", "draft")),
             ("ITER-c".to_string(), DocLookup::Absent),
         ]));
-        let ids = vec![
-            "ITER-a".to_string(),
-            "ITER-b".to_string(),
-            "ITER-c".to_string(),
-        ];
-
-        let decisions =
-            reconcile_running(&tracker, &RoleMapping::adr003_default(), &ids).unwrap();
+        let decisions = reconcile_running(
+            &tracker,
+            &RoleMapping::adr003_default(),
+            NOW,
+            0,
+            &running_views(&["ITER-a", "ITER-b", "ITER-c"]),
+        )
+        .unwrap();
 
         assert_eq!(
             decisions,
@@ -2508,12 +2569,83 @@ mod tests {
         let result = reconcile_running(
             &tracker,
             &RoleMapping::adr003_default(),
-            &["ITER-014".to_string(), "ITER-015".to_string()],
+            NOW,
+            0,
+            &running_views(&["ITER-014", "ITER-015"]),
         );
 
         assert!(
             matches!(result, Err(TrackerError::Command { .. })),
             "a refresh failure must surface as an error to retry: {result:?}"
+        );
+    }
+
+    #[test]
+    fn reconcile_running_stalls_a_worker_past_the_timeout_even_when_active() {
+        let tracker = tracker_with_lookups(std::collections::HashMap::from([(
+            "ITER-014".to_string(),
+            iteration_doc("ITER-014", "in-progress"), // active -> refresh would Retain
+        )]));
+        let running = vec![RunningView {
+            id: "ITER-014".to_string(),
+            started_at_ms: 1_000,
+            last_event_at_ms: None,
+            attempt: 3,
+        }];
+        let decisions =
+            reconcile_running(&tracker, &RoleMapping::adr003_default(), NOW, 100, &running).unwrap();
+        assert_eq!(
+            decisions,
+            vec![(
+                "ITER-014".to_string(),
+                RunningAction::TerminateAndRetry { attempt: 3 }
+            )],
+            "a stalled worker must be terminated+retried by the stall pass, not retained by the status refresh"
+        );
+    }
+
+    #[test]
+    fn reconcile_running_non_positive_timeout_skips_the_stall_pass() {
+        let tracker = tracker_with_lookups(std::collections::HashMap::from([(
+            "ITER-014".to_string(),
+            iteration_doc("ITER-014", "in-progress"),
+        )]));
+        let running = vec![RunningView {
+            id: "ITER-014".to_string(),
+            started_at_ms: 1_000,
+            last_event_at_ms: None,
+            attempt: 3,
+        }];
+        for disabled in [0i64, -1] {
+            let decisions =
+                reconcile_running(&tracker, &RoleMapping::adr003_default(), NOW, disabled, &running)
+                    .unwrap();
+            assert_eq!(
+                decisions,
+                vec![("ITER-014".to_string(), RunningAction::Retain)],
+                "disabled={disabled}"
+            );
+        }
+    }
+
+    #[test]
+    fn reconcile_running_a_fresh_event_resets_elapsed_and_retains() {
+        let tracker = tracker_with_lookups(std::collections::HashMap::from([(
+            "ITER-014".to_string(),
+            iteration_doc("ITER-014", "in-progress"),
+        )]));
+        let running = vec![RunningView {
+            id: "ITER-014".to_string(),
+            started_at_ms: 1_000,      // long ago
+            last_event_at_ms: Some(NOW), // but an event just arrived
+            attempt: 1,
+        }];
+        let decisions =
+            reconcile_running(&tracker, &RoleMapping::adr003_default(), NOW, 100, &running).unwrap();
+        assert_eq!(
+            decisions,
+            vec![("ITER-014".to_string(), RunningAction::Retain)],
+            "a fresh last_event_at_ms must reset elapsed so a live worker survives"
         );
     }
 }
