@@ -461,7 +461,6 @@ where
 
     let session = adapter.start_session(worktree.clone());
     let report = adapter.run_turn(&session, &prompt, on_progress).await;
-    adapter.stop(session).await;
     let ended_at_ms = now_ms();
 
     let (transition, transition_error) =
@@ -1221,8 +1220,6 @@ mod tests {
             *self.ran.lock().unwrap() = Some((session.path.clone(), prompt.to_string()));
             self.report.clone()
         }
-
-        async fn stop(&self, _session: Worktree) {}
     }
 
     /// A worktree lister fake: reports a fixed set of on-disk trees, or a scan

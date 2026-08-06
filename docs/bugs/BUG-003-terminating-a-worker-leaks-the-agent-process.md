@@ -1,7 +1,7 @@
 ---
 title: Terminating a worker leaks the agent process
 type: bug
-status: reported
+status: in-progress
 author: Jack Kaloger
 date: 2026-08-06
 tags: []

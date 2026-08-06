@@ -36,6 +36,11 @@ const CONTINUATION_RETRY_MS: u64 = 1000;
 /// at `config.max_retry_backoff_ms`.
 const BASE_RETRY_BACKOFF_MS: u64 = 10_000;
 
+/// How long the orchestrator waits for an aborted worker to take its agent
+/// process down with it. A worker wedged in code the runtime cannot cancel must
+/// not wedge the daemon with it, so the wait is bounded and reconcile proceeds.
+const WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+
 type SharedState = Arc<Mutex<DaemonState>>;
 
 /// Exponential backoff for the `attempt`-th failure (1-based, STORY-008 AC1):
@@ -535,7 +540,8 @@ where
                 &repo,
                 now,
                 config.stall_timeout_ms,
-            );
+            )
+            .await;
 
             // Re-read the interval fresh so a reload governs the next wait only
             // (ADR-006/ADR-007). The loop never blocks on a turn: it races the poll
@@ -681,7 +687,7 @@ fn handle_completion(
 /// - active: refresh the snapshot, keep the worker running (AC2);
 /// - neither: stop the worker and release the claim, leaving the tree (AC3).
 #[allow(clippy::too_many_arguments)]
-fn reconcile_running_workers<T: Tracker>(
+async fn reconcile_running_workers<T: Tracker>(
     tracker: &T,
     mapping: &RoleMapping,
     store: &Store,
@@ -726,7 +732,7 @@ fn reconcile_running_workers<T: Tracker>(
             }
             // AC1: stop the worker, remove its worktree, then free the slot.
             RunningAction::TerminateAndClean => {
-                if let Some(worktree) = stop_running(state, &id)
+                if let Some(worktree) = stop_running(state, &id).await
                     && let Err(e) = remove_worktree(repo, &worktree)
                 {
                     eprintln!(
@@ -741,7 +747,7 @@ fn reconcile_running_workers<T: Tracker>(
             }
             // AC3: stop the worker and free the slot, leaving the tree on disk.
             RunningAction::TerminateKeepTree => {
-                stop_running(state, &id);
+                stop_running(state, &id).await;
                 let _ = store.release(&id);
                 projection.record(now, &id, EventKind::ReconcileRelease, &[]);
                 snapshot.remove_ref(&id);
@@ -751,7 +757,7 @@ fn reconcile_running_workers<T: Tracker>(
             // (freeing the slot), release its claim, and queue a retry due now,
             // carrying the attempt. The tree is left on disk for inspection.
             RunningAction::TerminateAndRetry { attempt } => {
-                stop_running(state, &id);
+                stop_running(state, &id).await;
                 let _ = store.release(&id);
                 let _ = store.schedule_retry(&id, attempt, "stalled", now);
                 let attempt_str = attempt.to_string();
@@ -774,12 +780,26 @@ fn reconcile_running_workers<T: Tracker>(
 /// Abort the live worker for `id`, drop it from the registry, and hand back the
 /// worktree it occupied so a terminal reconcile can clean it (ADR-001: the
 /// orchestrator, not the agent, stops the run). `None` if no such worker.
-fn stop_running(state: &SharedState, id: &str) -> Option<PathBuf> {
-    let mut state = state.lock().unwrap();
-    let idx = state.running.iter().position(|item| item.id == id)?;
-    let item = state.running.remove(idx);
-    item.handle.abort();
-    Some(item.worktree)
+///
+/// Aborting only *schedules* the cancellation; the agent process dies when the
+/// runtime drops the worker's turn (ADR-008, BUG-003). So this awaits the aborted
+/// handle: every caller releases the claim and deletes the worktree the moment it
+/// returns, and neither may happen while the agent is still writing.
+async fn stop_running(state: &SharedState, id: &str) -> Option<PathBuf> {
+    let (handle, worktree) = {
+        let mut state = state.lock().unwrap();
+        let idx = state.running.iter().position(|item| item.id == id)?;
+        let item = state.running.remove(idx);
+        (item.handle, item.worktree)
+    };
+    handle.abort();
+    if tokio::time::timeout(WORKER_STOP_TIMEOUT, handle)
+        .await
+        .is_err()
+    {
+        eprintln!("agentd: warning: worker {id} did not stop within the kill timeout");
+    }
+    Some(worktree)
 }
 
 /// Mirror a dispatch pass that produced no worker (STORY-019 AC1 / STORY-061 AC1).
@@ -1260,8 +1280,6 @@ mod tests {
                 events: vec![AgentEvent::TurnCompleted { pid: 1, at_ms: 1 }],
             }
         }
-
-        async fn stop(&self, _session: Worktree) {}
     }
 
     fn git_ok(dir: &Path, args: &[&str]) {
@@ -1376,8 +1394,6 @@ mod tests {
                 }],
             }
         }
-
-        async fn stop(&self, _session: Worktree) {}
     }
 
     fn failing_blocking_adapter() -> (FailingBlockingAdapter, Arc<Notify>) {
@@ -2462,6 +2478,90 @@ max_concurrent = 5
         }
     }
 
+    /// A registry entry whose handle owns a real, long-lived OS process — a
+    /// worker that leaves something behind if the daemon fails to kill it. The
+    /// returned socket is the agent's stdout: it reaches EOF the instant that
+    /// process dies, which (unlike `kill -0`) does not wait for the child to be
+    /// reaped. Its `started_at_ms` sits far in the past, so a stall pass reads it
+    /// as stalled. Returns once the agent is confirmed running.
+    async fn running_item_with_live_agent(
+        id: &str,
+        worktree: PathBuf,
+        ready: PathBuf,
+    ) -> (RunningItem, std::os::unix::net::UnixStream) {
+        let (probe, agent_stdout) = std::os::unix::net::UnixStream::pair().unwrap();
+        // Bound the probe read now: macOS rejects the option once the peer is gone.
+        probe
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let script = format!("echo up > '{}'; exec sleep 300", ready.display());
+        let handle = tokio::spawn(async move {
+            let mut child = tokio::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(script)
+                .stdout(std::process::Stdio::from(std::os::fd::OwnedFd::from(
+                    agent_stdout,
+                )))
+                .kill_on_drop(true)
+                .spawn()
+                .expect("cannot spawn the fake agent");
+            let _ = child.wait().await;
+        });
+
+        for _ in 0..1000 {
+            if ready.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(ready.exists(), "the fake agent never started");
+
+        let item = RunningItem {
+            id: id.to_string(),
+            identifier: format!("iter-{id}"),
+            state: "in-progress".to_string(),
+            started_at_ms: 1_000,
+            worktree,
+            handle,
+            last_event_at_ms: None,
+            attempt: 3,
+        };
+        (item, probe)
+    }
+
+    /// Whether the agent behind `probe` had already died by the time this was
+    /// called — EOF means dead, a read timeout means still alive. The read blocks
+    /// this thread rather than awaiting, so the runtime cannot drop an aborted
+    /// worker (and kill its child) while we look: only a kill that already
+    /// happened can be observed.
+    fn agent_already_dead(probe: std::os::unix::net::UnixStream) -> bool {
+        use std::io::Read;
+        matches!((&probe).read(&mut [0u8; 1]), Ok(0))
+    }
+
+    // BUG-003 / ADR-008: every caller releases the claim and deletes the worktree
+    // the moment `stop_running` hands the tree back, so the agent process must
+    // already be dead when it does — not merely scheduled for death.
+    #[tokio::test]
+    async fn stop_running_returns_only_once_the_agent_process_is_dead() {
+        let scratch = TempDir::new().unwrap();
+        let state: SharedState = Arc::new(Mutex::new(DaemonState::default()));
+        let (item, probe) = running_item_with_live_agent(
+            "ITER-700",
+            scratch.path().join("tree"),
+            scratch.path().join("ready"),
+        )
+        .await;
+        state.lock().unwrap().running.push(item);
+
+        stop_running(&state, "ITER-700").await;
+
+        assert!(
+            agent_already_dead(probe),
+            "the agent was still alive when the daemon moved on to release its claim"
+        );
+    }
+
     // STORY-010 AC1: a running item now terminal is terminated, its worktree is
     // removed, and its claim is released so the slot frees.
     #[tokio::test]
@@ -2478,11 +2578,13 @@ max_concurrent = 5
             .unwrap();
 
         let state: SharedState = Arc::new(Mutex::new(DaemonState::default()));
-        state
-            .lock()
-            .unwrap()
-            .running
-            .push(running_item_for("ITER-500", wt.path.clone()));
+        let (item, probe) = running_item_with_live_agent(
+            "ITER-500",
+            wt.path.clone(),
+            store_dir.join("ITER-500.ready"),
+        )
+        .await;
+        state.lock().unwrap().running.push(item);
 
         let tracker = ReconcileTracker {
             lookups: std::collections::HashMap::from([(
@@ -2502,7 +2604,8 @@ max_concurrent = 5
             repo.path(),
             now_ms(),
             0,
-        );
+        )
+        .await;
 
         assert!(
             state.lock().unwrap().running.is_empty(),
@@ -2513,6 +2616,12 @@ max_concurrent = 5
             store.get("ITER-500").unwrap(),
             None,
             "its claim must be released"
+        );
+        // BUG-003: the tree was deleted and the claim released above — neither may
+        // happen with the agent still alive in that tree.
+        assert!(
+            agent_already_dead(probe),
+            "the agent survived the removal of its worktree"
         );
     }
 
@@ -2556,7 +2665,8 @@ max_concurrent = 5
             repo.path(),
             now_ms(),
             0,
-        );
+        )
+        .await;
 
         assert_eq!(
             state.lock().unwrap().running.len(),
@@ -2621,7 +2731,8 @@ max_concurrent = 5
             repo.path(),
             now_ms(),
             0,
-        );
+        )
+        .await;
 
         assert!(
             state.lock().unwrap().running.is_empty(),
@@ -2679,7 +2790,8 @@ max_concurrent = 5
             repo.path(),
             now_ms(),
             0,
-        );
+        )
+        .await;
 
         assert_eq!(
             state.lock().unwrap().running.len(),
@@ -2713,16 +2825,13 @@ max_concurrent = 5
             .unwrap();
 
         let state: SharedState = Arc::new(Mutex::new(DaemonState::default()));
-        state.lock().unwrap().running.push(RunningItem {
-            id: "ITER-600".to_string(),
-            identifier: "iter-600".to_string(),
-            state: "in-progress".to_string(),
-            started_at_ms: 1_000, // long before `now`
-            worktree: wt.path.clone(),
-            handle: tokio::spawn(std::future::pending::<()>()),
-            last_event_at_ms: None,
-            attempt: 3,
-        });
+        let (item, probe) = running_item_with_live_agent(
+            "ITER-600",
+            wt.path.clone(),
+            store_dir.join("ITER-600.ready"),
+        )
+        .await;
+        state.lock().unwrap().running.push(item);
 
         // The doc is STILL ACTIVE, so the status refresh would Retain it — the stall
         // pass must win (AC3 ordering).
@@ -2744,7 +2853,8 @@ max_concurrent = 5
             repo.path(),
             now,
             100, // stall_timeout_ms; elapsed (now-1000) >> 100
-        );
+        )
+        .await;
 
         assert!(
             state.lock().unwrap().running.is_empty(),
@@ -2763,6 +2873,12 @@ max_concurrent = 5
         assert_eq!(retry.attempt, 3, "the attempt carries through unchanged");
         assert_eq!(retry.error, "stalled");
         assert_eq!(retry.due_at, now, "the stall retry is due now");
+        // BUG-003: killing a stalled agent must kill it before the item it was
+        // working on is released and queued for another worker.
+        assert!(
+            agent_already_dead(probe),
+            "the stalled agent outlived the release of its claim"
+        );
     }
 
     // STORY-011 AC2: a non-positive stall timeout skips the stall pass — the same
@@ -2812,7 +2928,8 @@ max_concurrent = 5
             repo.path(),
             now,
             0,
-        );
+        )
+        .await;
 
         assert_eq!(
             state.lock().unwrap().running.len(),

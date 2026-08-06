@@ -10,7 +10,11 @@ use crate::workspace::Worktree;
 /// One agent backend behind the canonical `AgentEvent` model (ADR-004). The
 /// claude adapter drives one-shot `claude -p` turns — the process exits after a
 /// turn — while a persistent backend (codex) would keep a live process across
-/// turns behind the same three methods.
+/// turns behind the same two methods.
+///
+/// There is deliberately no `stop`: the orchestrator stops a worker by dropping
+/// its turn (ADR-008), so an implementation must tie its process to the lifetime
+/// of the `run_turn` future rather than to a call it can only hope arrives.
 pub trait AgentAdapter {
     type Session;
 
@@ -25,8 +29,6 @@ pub trait AgentAdapter {
         prompt: &str,
         on_progress: &(dyn Fn() + Send + Sync),
     ) -> impl std::future::Future<Output = TurnReport> + Send;
-
-    fn stop(&self, session: Self::Session) -> impl std::future::Future<Output = ()> + Send;
 }
 
 /// The canonical events observed during a turn plus the adapter's authoritative
@@ -105,6 +107,7 @@ impl AgentAdapter for ClaudeAdapter {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
+            .kill_on_drop(true)
             .spawn()
         {
             Ok(child) => child,
@@ -177,8 +180,6 @@ impl AgentAdapter for ClaudeAdapter {
 
         TurnReport { outcome, events }
     }
-
-    async fn stop(&self, _session: ClaudeSession) {}
 }
 
 fn failure_reason(
@@ -248,16 +249,36 @@ mod tests {
         std::fs::canonicalize(path).unwrap()
     }
 
+    fn process_alive(pid: u32) -> bool {
+        std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("kill -0 {pid}"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("cannot probe process liveness")
+            .success()
+    }
+
+    async fn poll_until(deadline: Duration, mut done: impl FnMut() -> bool) -> bool {
+        let step = Duration::from_millis(10);
+        for _ in 0..(deadline.as_millis() / step.as_millis()) {
+            if done() {
+                return true;
+            }
+            tokio::time::sleep(step).await;
+        }
+        false
+    }
+
     async fn run(adapter: &ClaudeAdapter, wt: Worktree, prompt: &str) -> TurnReport {
         let session = adapter.start_session(wt);
-        let report = tokio::time::timeout(
+        tokio::time::timeout(
             Duration::from_secs(10),
             adapter.run_turn(&session, prompt, &|| {}),
         )
         .await
-        .expect("run_turn hung");
-        adapter.stop(session).await;
-        report
+        .expect("run_turn hung")
     }
 
     #[tokio::test]
@@ -413,5 +434,42 @@ mod tests {
             report.outcome
         );
         assert!(report.events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn aborting_a_turn_kills_the_agent_process() {
+        let scratch = TempDir::new().unwrap();
+        let wt_dir = TempDir::new().unwrap();
+        let pid_file = scratch.path().join("agent.pid");
+        let body = format!(
+            "#!/bin/sh\necho $$ > '{pid}'\nexec sleep 300\n",
+            pid = pid_file.display(),
+        );
+        let program = write_fake(scratch.path(), &body);
+        let wt = worktree(wt_dir.path());
+
+        let turn = tokio::spawn(async move {
+            let adapter = ClaudeAdapter::with_program(program.to_str().unwrap(), vec![]);
+            let session = adapter.start_session(wt);
+            adapter.run_turn(&session, "p", &|| {}).await
+        });
+
+        let mut spawned = None;
+        poll_until(Duration::from_secs(10), || {
+            spawned = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok());
+            spawned.is_some()
+        })
+        .await;
+        let pid = spawned.expect("fake agent never reported its pid");
+        assert!(process_alive(pid), "agent {pid} should be running mid-turn");
+
+        turn.abort();
+
+        assert!(
+            poll_until(Duration::from_secs(10), || !process_alive(pid)).await,
+            "agent {pid} outlived the worker that owned it",
+        );
     }
 }
