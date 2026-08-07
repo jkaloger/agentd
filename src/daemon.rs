@@ -696,15 +696,23 @@ fn handle_completion(
     // `schedule_retry` replaces any prior entry for the id, so exactly one durable
     // schedule remains. These branches are mutually exclusive: a clean exit never
     // schedules a backoff, a failed one never a continuation.
-    let mut retry = None;
-    if !clean {
+    //
+    // Neither runs for a run the daemon no longer owns. A backoff is as much a
+    // future re-dispatch as a continuation is, and it upserts, so an unowned failure
+    // would overwrite the schedule the stall kill or terminal reconcile that stopped
+    // this worker just wrote — delaying (or resurrecting) an item whose claim is
+    // already released.
+    let retry = if !owned {
+        None
+    } else if clean {
+        schedule_continuation(store, &record.id, attempt);
+        None
+    } else {
         let error = record.failure_detail().to_string();
         let due_at = now_ms() + retry_backoff_ms(attempt, max_retry_backoff_ms);
         let _ = store.schedule_retry(&record.id, attempt, &error, due_at);
-        retry = Some((attempt, error));
-    } else if owned {
-        schedule_continuation(store, &record.id, attempt);
-    }
+        Some((attempt, error))
+    };
 
     let mut state = state.lock().unwrap();
     state.running.retain(|item| item.id != record.id);
@@ -714,15 +722,26 @@ fn handle_completion(
     // mirrors and status would show the item queued forever.
     state.queued.retain(|q| q.id != record.id);
     if let Some((attempt, error)) = retry {
-        state.queued.push(QueuedRetry {
-            id: record.id.clone(),
-            identifier: record.identifier.clone(),
-            attempt,
-            error,
-            started_at_ms: record.started_at_ms,
-        });
+        upsert_queued(
+            &mut state,
+            QueuedRetry {
+                id: record.id.clone(),
+                identifier: record.identifier.clone(),
+                attempt,
+                error,
+                started_at_ms: record.started_at_ms,
+            },
+        );
     }
     state.records.push(record);
+}
+
+/// Mirror a durable retry schedule into the operator-facing `queued` view. Keyed
+/// by id like `schedule_retry` is, so the row replaces any the item already had
+/// rather than stacking a second one beside a schedule that no longer exists.
+fn upsert_queued(state: &mut DaemonState, row: QueuedRetry) {
+    state.queued.retain(|q| q.id != row.id);
+    state.queued.push(row);
 }
 
 /// Drop the `queued` rows a fire pass resolved (AC5): a re-dispatched item is
@@ -855,15 +874,16 @@ async fn reconcile_running_workers<T: Tracker>(
                 // path writes (STORY-008 AC3, AC5): the item is waiting on a retry,
                 // not gone, so status must say so until the fire re-dispatches it.
                 if let Some((identifier, started_at_ms)) = stalled {
-                    let mut st = state.lock().unwrap();
-                    st.queued.retain(|q| q.id != id);
-                    st.queued.push(QueuedRetry {
-                        id: id.clone(),
-                        identifier,
-                        attempt,
-                        error: "stalled".to_string(),
-                        started_at_ms,
-                    });
+                    upsert_queued(
+                        &mut state.lock().unwrap(),
+                        QueuedRetry {
+                            id: id.clone(),
+                            identifier,
+                            attempt,
+                            error: "stalled".to_string(),
+                            started_at_ms,
+                        },
+                    );
                 }
                 let attempt_str = attempt.to_string();
                 projection.record(
@@ -2255,8 +2275,8 @@ mod tests {
     // a backoff retry with the failure detail and surfaces it in status; a second
     // failure bumps the attempt (doubling the backoff) and replaces the entry, so
     // exactly one durable schedule and one queued view remain.
-    #[test]
-    fn a_failed_completion_schedules_a_backoff_retry_replaces_it_and_surfaces_it() {
+    #[tokio::test]
+    async fn a_failed_completion_schedules_a_backoff_retry_replaces_it_and_surfaces_it() {
         let dir = TempDir::new().unwrap();
         let store = Store::open(&dir.path().join("store.redb")).unwrap();
         let projection = Projection::new(dir.path().join("log"));
@@ -2264,6 +2284,12 @@ mod tests {
         let state: SharedState = Arc::new(Mutex::new(DaemonState::default()));
         let max = 3_600_000;
 
+        // Tracked, so it is the failure — not the ownership guard — that decides.
+        state
+            .lock()
+            .unwrap()
+            .running
+            .push(running_item_for("ITER-001", dir.path().join("tree")));
         let before = now_ms();
         handle_completion(
             failed_completion("ITER-001", "boom", 1),
@@ -2301,6 +2327,11 @@ mod tests {
         // AC1/AC2: a second failure — the attempt-2 run a fired retry started —
         // records attempt 2 (backoff doubled) and the replace semantics leave
         // exactly one durable entry and one queued view.
+        state
+            .lock()
+            .unwrap()
+            .running
+            .push(running_item_for("ITER-001", dir.path().join("tree")));
         let before = now_ms();
         handle_completion(
             failed_completion("ITER-001", "boom again", 2),
@@ -2346,8 +2377,8 @@ mod tests {
     // before re-dispatching, so the attempt-2 run it starts finds redb empty for its
     // id — reconstructing the attempt from the store would reset it to 1 and the
     // delay would never grow across re-dispatches.
-    #[test]
-    fn a_re_dispatched_runs_failure_escalates_the_backoff_from_its_own_attempt() {
+    #[tokio::test]
+    async fn a_re_dispatched_runs_failure_escalates_the_backoff_from_its_own_attempt() {
         let dir = TempDir::new().unwrap();
         let store = Store::open(&dir.path().join("store.redb")).unwrap();
         let projection = Projection::new(dir.path().join("log"));
@@ -2355,6 +2386,11 @@ mod tests {
         let state: SharedState = Arc::new(Mutex::new(DaemonState::default()));
         let max = 3_600_000;
 
+        state
+            .lock()
+            .unwrap()
+            .running
+            .push(running_item_for("ITER-001", dir.path().join("tree")));
         handle_completion(
             failed_completion("ITER-001", "boom", 1),
             &store,
@@ -2365,6 +2401,12 @@ mod tests {
         );
         store.clear_retry("ITER-001").unwrap();
 
+        // The re-dispatched run: tracked again under its own registry entry.
+        state
+            .lock()
+            .unwrap()
+            .running
+            .push(running_item_for("ITER-001", dir.path().join("tree")));
         let before = now_ms();
         handle_completion(
             failed_completion("ITER-001", "boom again", 2),
@@ -2515,6 +2557,58 @@ mod tests {
         assert!(
             state.lock().unwrap().queued.is_empty(),
             "and it surfaces no queued row either"
+        );
+        assert_eq!(
+            state.lock().unwrap().records.len(),
+            1,
+            "the late completion is still recorded — it is not an error"
+        );
+    }
+
+    // ITERATION-039 task 7, the failure arm: the same race, but the turn reports a
+    // failure rather than a clean exit. Its backoff upserts, so an ungated one
+    // overwrites the retry the stall kill that stopped this worker just scheduled —
+    // pushing an item due now out to a backoff delay, against a released claim.
+    #[tokio::test]
+    async fn a_failed_completion_arriving_after_the_worker_was_stopped_schedules_no_backoff() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(&dir.path().join("store.redb")).unwrap();
+        let projection = Projection::new(dir.path().join("log"));
+        let snapshot = Snapshot::new(dir.path().to_path_buf());
+        let state: SharedState = Arc::new(Mutex::new(DaemonState::default()));
+        state
+            .lock()
+            .unwrap()
+            .running
+            .push(running_item_for("ITER-001", dir.path().join("tree")));
+
+        // The stall kill: the worker leaves the registry, its claim is released, and
+        // it schedules its own immediate retry on attempt 3.
+        stop_running(&state, "ITER-001").await;
+        let _ = store.release("ITER-001");
+        let due_at = now_ms();
+        store
+            .schedule_retry("ITER-001", 3, "stalled", due_at)
+            .unwrap();
+
+        handle_completion(
+            failed_completion("ITER-001", "boom", 1),
+            &store,
+            &projection,
+            &snapshot,
+            &state,
+            3_600_000,
+        );
+
+        let retry = pending_retry(&store, "ITER-001").unwrap();
+        assert_eq!(
+            (retry.attempt, retry.error.as_str(), retry.due_at),
+            (3, "stalled", due_at),
+            "the stall's schedule must survive: a late failure owns nothing to reschedule"
+        );
+        assert!(
+            state.lock().unwrap().queued.is_empty(),
+            "and it surfaces no queued row of its own"
         );
         assert_eq!(
             state.lock().unwrap().records.len(),
