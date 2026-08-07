@@ -32,9 +32,19 @@ pub struct RetryRecord {
 
 #[derive(Debug)]
 pub enum ClaimError {
-    AlreadyClaimed(ClaimRecord),
+    /// A live lease belongs to someone else: a genuine conflict, never stolen.
+    HeldByOther(ClaimRecord),
+    /// A live lease this same holder already owns. `claim` refuses it so a caller
+    /// cannot take a second lease over its own; `claim_or_renew` renews it instead.
+    HeldBySelf(ClaimRecord),
     Storage(redb::Error),
     Encode(serde_json::Error),
+}
+
+/// Whether a live lease the caller already holds may be renewed in place.
+enum Renewal {
+    Allow,
+    Refuse,
 }
 
 #[derive(Debug)]
@@ -83,6 +93,32 @@ impl Store {
         now: u64,
         lease_ttl: Duration,
     ) -> Result<ClaimRecord, ClaimError> {
+        self.acquire(id, holder, now, lease_ttl, Renewal::Refuse)
+    }
+
+    /// Claim `id` for `holder`, renewing in place when `holder` already holds the
+    /// live lease. A caller that kept its claim across a gap — a continuation retry
+    /// re-dispatching the item it never let go of — is asking for the lease it
+    /// already owns, not a second one, so the fence stands and only the expiry
+    /// moves, as `heartbeat` does. A lease held by anyone else is still refused.
+    pub fn claim_or_renew(
+        &self,
+        id: &str,
+        holder: &str,
+        now: u64,
+        lease_ttl: Duration,
+    ) -> Result<ClaimRecord, ClaimError> {
+        self.acquire(id, holder, now, lease_ttl, Renewal::Allow)
+    }
+
+    fn acquire(
+        &self,
+        id: &str,
+        holder: &str,
+        now: u64,
+        lease_ttl: Duration,
+        renewal: Renewal,
+    ) -> Result<ClaimRecord, ClaimError> {
         let txn = self.db.begin_write().map_err(claim_storage)?;
         let record = {
             let mut table = txn.open_table(CLAIMS).map_err(claim_storage)?;
@@ -91,10 +127,20 @@ impl Store {
             if let Some(existing) = table.get(id).map_err(claim_storage)? {
                 let existing: ClaimRecord =
                     serde_json::from_slice(existing.value()).map_err(ClaimError::Encode)?;
-                if existing.due_at > now {
-                    return Err(ClaimError::AlreadyClaimed(existing));
+                let expired = existing.due_at <= now;
+                if !expired && existing.holder != holder {
+                    return Err(ClaimError::HeldByOther(existing));
                 }
-                fence = existing.fence + 1;
+                if !expired && matches!(renewal, Renewal::Refuse) {
+                    return Err(ClaimError::HeldBySelf(existing));
+                }
+                // A renewed lease is the same claim with a later expiry, so its
+                // fence stands; a reclaimed expired one supersedes its holder.
+                fence = if expired {
+                    existing.fence + 1
+                } else {
+                    existing.fence
+                };
             }
 
             let record = ClaimRecord {
@@ -312,7 +358,7 @@ mod tests {
         for handle in handles {
             match handle.join().unwrap() {
                 Ok(_) => winners += 1,
-                Err(ClaimError::AlreadyClaimed(_)) => {}
+                Err(ClaimError::HeldByOther(_)) => {}
                 Err(other) => panic!("unexpected error: {other:?}"),
             }
         }
@@ -329,10 +375,78 @@ mod tests {
             .claim("ITER-007", "agent-b", 2000, TTL)
             .expect_err("live lease must not be overwritten");
         match err {
-            ClaimError::AlreadyClaimed(held) => assert_eq!(held, first),
-            other => panic!("expected AlreadyClaimed, got {other:?}"),
+            ClaimError::HeldByOther(held) => assert_eq!(held, first),
+            other => panic!("expected HeldByOther, got {other:?}"),
         }
         assert_eq!(store.get("ITER-007").unwrap().unwrap().holder, "agent-a");
+    }
+
+    #[test]
+    fn claim_refuses_a_live_lease_its_own_holder_already_owns() {
+        let dir = TempDir::new().unwrap();
+        let store = open(&dir);
+
+        let first = store.claim("ITER-007", "agent-a", 1000, TTL).unwrap();
+        let err = store
+            .claim("ITER-007", "agent-a", 2000, TTL)
+            .expect_err("a holder must not take a second lease over its own claim");
+        match err {
+            ClaimError::HeldBySelf(held) => assert_eq!(held, first),
+            other => panic!("expected HeldBySelf, got {other:?}"),
+        }
+        assert_eq!(store.get("ITER-007").unwrap(), Some(first));
+    }
+
+    #[test]
+    fn claim_or_renew_extends_the_live_lease_its_own_holder_owns() {
+        let dir = TempDir::new().unwrap();
+        let store = open(&dir);
+
+        let first = store.claim("ITER-007", "agent-a", 1000, TTL).unwrap();
+        let renewed = store
+            .claim_or_renew("ITER-007", "agent-a", 2000, TTL)
+            .unwrap();
+
+        assert_eq!(renewed.holder, "agent-a");
+        assert_eq!(renewed.due_at, 2000 + 60_000);
+        assert_eq!(
+            renewed.fence, first.fence,
+            "a renewal is the same claim, so a heartbeat holding the fence stays valid"
+        );
+        assert_eq!(store.get("ITER-007").unwrap(), Some(renewed));
+    }
+
+    #[test]
+    fn claim_or_renew_refuses_a_live_lease_another_holder_owns() {
+        let dir = TempDir::new().unwrap();
+        let store = open(&dir);
+
+        let first = store.claim("ITER-007", "agent-a", 1000, TTL).unwrap();
+        let err = store
+            .claim_or_renew("ITER-007", "agent-b", 2000, TTL)
+            .expect_err("a renewal must never steal another holder's lease");
+        match err {
+            ClaimError::HeldByOther(held) => assert_eq!(held, first),
+            other => panic!("expected HeldByOther, got {other:?}"),
+        }
+        assert_eq!(store.get("ITER-007").unwrap(), Some(first));
+    }
+
+    #[test]
+    fn claim_or_renew_takes_an_expired_lease_and_bumps_the_fence() {
+        let dir = TempDir::new().unwrap();
+        let store = open(&dir);
+
+        let first = store.claim("ITER-007", "agent-a", 1000, TTL).unwrap();
+        let retaken = store
+            .claim_or_renew("ITER-007", "agent-a", first.due_at + 1, TTL)
+            .unwrap();
+
+        assert_eq!(
+            retaken.fence,
+            first.fence + 1,
+            "an expired lease is retaken, not renewed, so the prior fence is superseded"
+        );
     }
 
     #[test]

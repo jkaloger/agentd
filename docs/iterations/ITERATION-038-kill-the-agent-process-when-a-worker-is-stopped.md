@@ -1,7 +1,7 @@
 ---
 title: Kill the agent process when a worker is stopped
 type: iteration
-status: in-progress
+status: complete
 author: Jack Kaloger
 date: 2026-08-06
 tags: []

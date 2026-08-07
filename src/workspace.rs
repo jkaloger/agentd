@@ -12,6 +12,29 @@ pub struct Worktree {
     pub branch: String,
 }
 
+/// How an iteration's worktree came to be ready for the run about to use it
+/// (BUG-002). A re-dispatch is not always a fresh start: the stall path kills the
+/// worker and keeps the tree (`RunningAction::TerminateAndRetry`), so the retry
+/// that follows finds one already there. Keeping the two apart makes "a tree is
+/// already here" a state the caller handles rather than a `worktree add` failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreparedWorktree {
+    /// A new tree on a new branch, cut from the base repo's HEAD.
+    Created(Worktree),
+    /// The tree a previous run left behind, re-entered on the branch its work is
+    /// on. The work in it is why the stall path kept it, so the retry resumes
+    /// there rather than discarding it.
+    Adopted(Worktree),
+}
+
+impl PreparedWorktree {
+    pub fn into_worktree(self) -> Worktree {
+        match self {
+            PreparedWorktree::Created(worktree) | PreparedWorktree::Adopted(worktree) => worktree,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum WorkspaceError {
     PathEscapesRoot { iter_id: String, root: PathBuf },
@@ -149,6 +172,12 @@ pub fn list_worktrees(root: &Path) -> Result<BTreeSet<String>, WorktreeListError
 /// Prepare an isolated worktree for `iter_id` under `root`, branching off the
 /// current HEAD of `repo` (`git worktree add <root>/<iter-id> -b <branch>`).
 ///
+/// A tree a previous run left at that path is adopted rather than collided with
+/// (BUG-002): the stall path kills a hung worker and keeps its tree, so the retry
+/// it schedules arrives here to find one already present, and the work in it is
+/// what the retry resumes. Only a path git does not recognise as a worktree — a
+/// stray directory in the way — still fails.
+///
 /// The branch defaults to `agentd/<iter-id>`; a lazyspec `branch_name` override
 /// is honoured when supplied. The target path is checked to stay under `root`
 /// before git is touched, and a failed attempt cleans up any artifact it created
@@ -158,12 +187,16 @@ pub fn prepare_worktree(
     root: &Path,
     iter_id: &str,
     branch_name: Option<&str>,
-) -> Result<Worktree, WorkspaceError> {
+) -> Result<PreparedWorktree, WorkspaceError> {
     let path =
         resolve_under_root(root, iter_id).ok_or_else(|| WorkspaceError::PathEscapesRoot {
             iter_id: iter_id.to_string(),
             root: root.to_path_buf(),
         })?;
+    if let Some(existing) = worktree_at(&path) {
+        return Ok(PreparedWorktree::Adopted(existing));
+    }
+
     let branch = branch_name
         .map(str::to_string)
         .unwrap_or_else(|| format!("agentd/{iter_id}"));
@@ -191,7 +224,42 @@ pub fn prepare_worktree(
         });
     }
 
-    Ok(Worktree { path, branch })
+    Ok(PreparedWorktree::Created(Worktree { path, branch }))
+}
+
+/// The worktree already at `path`, if there is one. Git reports the top level of
+/// the working tree containing `path`, so a stray directory inside the repo names
+/// the repo's own root and is correctly not adoptable — only a path that is its
+/// own top level is a worktree. The branch is read back rather than recomputed:
+/// the branch a previous run's work sits on is the one to resume, whatever the
+/// caller would have named a fresh one.
+fn worktree_at(path: &Path) -> Option<Worktree> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "--show-toplevel", "--abbrev-ref", "HEAD"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut lines = stdout.lines();
+    let toplevel = PathBuf::from(lines.next()?);
+    let branch = lines.next()?.to_string();
+    same_file(&toplevel, path).then(|| Worktree {
+        path: path.to_path_buf(),
+        branch,
+    })
+}
+
+/// Whether two paths name the same existing directory. Git reports a fully
+/// resolved path, so a lexical comparison would miss a symlinked workspace root.
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// On failure, drop only what this attempt created: remove the target directory
@@ -305,8 +373,11 @@ mod tests {
         let root = repo.path().join(".agentd/workspaces");
         let base_head = git_ok(repo.path(), &["rev-parse", "HEAD"]);
 
-        let wt = prepare_worktree(repo.path(), &root, "ITER-009", None).unwrap();
+        let prepared = prepare_worktree(repo.path(), &root, "ITER-009", None).unwrap();
 
+        let PreparedWorktree::Created(wt) = prepared else {
+            panic!("nothing was there to adopt: {prepared:?}");
+        };
         assert!(wt.path.is_dir());
         assert!(wt.path.starts_with(normalize(&root)));
         assert_eq!(wt.branch, "agentd/ITER-009");
@@ -322,7 +393,9 @@ mod tests {
         let repo = init_repo();
         let root = repo.path().join(".agentd/workspaces");
 
-        let wt = prepare_worktree(repo.path(), &root, "ITER-009", Some("feature/custom")).unwrap();
+        let wt = prepare_worktree(repo.path(), &root, "ITER-009", Some("feature/custom"))
+            .unwrap()
+            .into_worktree();
 
         assert_eq!(wt.branch, "feature/custom");
         assert_eq!(
@@ -331,27 +404,57 @@ mod tests {
         );
     }
 
+    // BUG-002: a stall kill keeps the tree deliberately, so the retry that follows
+    // prepares an id whose tree is already there. That collision must resolve to the
+    // work the killed run left, not to a `worktree add` failure.
     #[test]
-    fn a_repeated_attempt_fails_cleanly_leaving_no_partial_tree() {
+    fn a_repeated_attempt_adopts_the_tree_the_first_left_behind() {
         let repo = init_repo();
         let root = repo.path().join(".agentd/workspaces");
+        let first = prepare_worktree(repo.path(), &root, "ITER-009", None)
+            .unwrap()
+            .into_worktree();
+        std::fs::write(first.path.join("half-done.txt"), "what the killed run left").unwrap();
 
-        let first = prepare_worktree(repo.path(), &root, "ITER-009", None).unwrap();
-        assert!(first.path.is_dir());
+        let again = prepare_worktree(repo.path(), &root, "ITER-009", None).unwrap();
 
-        let err = prepare_worktree(repo.path(), &root, "ITER-009", None).unwrap_err();
-
-        assert!(matches!(err, WorkspaceError::Git { .. }), "{err}");
-        assert!(!err.to_string().is_empty());
+        let PreparedWorktree::Adopted(adopted) = again else {
+            panic!("a tree already on disk must be adopted, not created: {again:?}");
+        };
+        assert_eq!(adopted, first);
+        assert_eq!(
+            std::fs::read_to_string(adopted.path.join("half-done.txt")).unwrap(),
+            "what the killed run left",
+            "the point of keeping the tree is the work in it"
+        );
         assert_eq!(
             worktree_count(repo.path()),
             2,
-            "only the main worktree and the first attempt must remain registered"
+            "adoption registers no second worktree"
         );
         assert_eq!(
-            git_ok(&first.path, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            git_ok(&adopted.path, &["rev-parse", "--abbrev-ref", "HEAD"]),
             "agentd/ITER-009",
-            "the first worktree must stay usable"
+            "the adopted tree stays on the branch its work is on"
+        );
+    }
+
+    // A directory that is not a worktree of this repo is not adoptable: it stays a
+    // reported failure rather than being mistaken for a previous run's tree.
+    #[test]
+    fn a_plain_directory_in_the_way_is_a_reported_failure_not_an_adoption() {
+        let repo = init_repo();
+        let root = repo.path().join(".agentd/workspaces");
+        std::fs::create_dir_all(root.join("ITER-010")).unwrap();
+        std::fs::write(root.join("ITER-010/stray.txt"), "not a worktree").unwrap();
+
+        let err = prepare_worktree(repo.path(), &root, "ITER-010", None).unwrap_err();
+
+        assert!(matches!(err, WorkspaceError::Git { .. }), "{err}");
+        assert_eq!(
+            worktree_count(repo.path()),
+            1,
+            "only the main worktree may remain registered"
         );
     }
 
@@ -402,7 +505,9 @@ mod tests {
     fn remove_worktree_deletes_the_tree_and_unregisters_it() {
         let repo = init_repo();
         let root = repo.path().join(".agentd/workspaces");
-        let wt = prepare_worktree(repo.path(), &root, "ITER-300", None).unwrap();
+        let wt = prepare_worktree(repo.path(), &root, "ITER-300", None)
+            .unwrap()
+            .into_worktree();
         assert!(wt.path.is_dir());
         assert_eq!(worktree_count(repo.path()), 2);
 
@@ -422,7 +527,9 @@ mod tests {
     fn remove_worktree_forces_removal_of_a_dirty_tree() {
         let repo = init_repo();
         let root = repo.path().join(".agentd/workspaces");
-        let wt = prepare_worktree(repo.path(), &root, "ITER-301", None).unwrap();
+        let wt = prepare_worktree(repo.path(), &root, "ITER-301", None)
+            .unwrap()
+            .into_worktree();
         std::fs::write(wt.path.join("dirty.txt"), "uncommitted").unwrap();
 
         remove_worktree(repo.path(), &wt.path).unwrap();

@@ -1,7 +1,7 @@
 ---
 title: Scheduled retries are never fired
 type: bug
-status: reported
+status: fixed
 author: Jack Kaloger
 date: 2026-08-06
 tags: []

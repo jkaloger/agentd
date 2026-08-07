@@ -131,6 +131,10 @@ mod tests {
             unimplemented!("not exercised by prompt tests")
         }
 
+        fn fetch_candidate(&self, _id: &str) -> Result<Candidate, TrackerError> {
+            unimplemented!("not exercised by prompt tests")
+        }
+
         fn advance(&self, _id: &str, _target_state: &str) -> Result<(), TrackerError> {
             unimplemented!("not exercised by prompt tests")
         }

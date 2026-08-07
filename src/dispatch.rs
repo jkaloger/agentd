@@ -30,15 +30,25 @@ where
         .claim(&candidate.id, holder, now, lease_ttl)
         .map_err(DispatchError::Claim)?;
 
-    if let Err(advance_err) = tracker.advance(&candidate.id, active_state) {
-        store
-            .release(&candidate.id)
-            .map_err(DispatchError::Release)?;
-        return Err(DispatchError::Advance(advance_err));
-    }
+    activate_or_release(tracker, store, &candidate.id, active_state)?;
 
     start_agent();
     Ok(record)
+}
+
+/// Advance a claimed `id` to the active state, releasing its claim when the
+/// tracker refuses — an item that could not be activated must not be left held.
+pub fn activate_or_release<T: Tracker>(
+    tracker: &T,
+    store: &Store,
+    id: &str,
+    active_state: &str,
+) -> Result<(), DispatchError> {
+    if let Err(advance_err) = tracker.advance(id, active_state) {
+        store.release(id).map_err(DispatchError::Release)?;
+        return Err(DispatchError::Advance(advance_err));
+    }
+    Ok(())
 }
 
 #[derive(Debug)]

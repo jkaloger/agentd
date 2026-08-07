@@ -1,14 +1,13 @@
 ---
 title: Fire due retries from the daemon loop
 type: iteration
-status: draft
+status: complete
 author: Jack Kaloger
 date: 2026-08-06
 tags: []
 related:
 - implements: BUG-002
 ---
-
 ## Objective
 Wire due-retry firing into the daemon's orchestrator loop and reshape the handler so a fired retry can actually re-dispatch: decide from the item's real state, and spawn a tracked worker rather than awaiting one inline.
 
@@ -19,6 +18,28 @@ Wire due-retry firing into the daemon's orchestrator loop and reshape the handle
 - `fetch_dispatchable` only offers **dispatch-role** documents. At fire time a retried item is never in a dispatch role: continuation and backoff retries follow an advance to a terminal state, and a stall-killed item is still in the **active** state. Decide from `lookup_doc` plus the role mapping, the way `reconcile_running` already does — that is the established seam for "what state is this item actually in".
 - The three producers are in `src/daemon.rs`: clean-exit continuation, failure backoff, and the stall kill.
 - `src/tick.rs` retry tests currently pass because `FakeTracker` offers the retried item as an `accepted` candidate — a state a real retried item cannot occupy. Those fakes must be corrected to the real states, and the corrected tests must be shown to fail against the current handler before the fix.
+
+### Decision: what a fired retry does for a terminal item
+
+Recorded during execution of task 2. A terminal item's retry is a **release**, not a re-dispatch.
+
+- Re-dispatch goes through `claim_and_activate`, which advances the doc to the active state. The lifecycle DAG has no edge from any terminal status back to a dispatch or active status (`.lazyspec.toml`: the only outbound edge from a terminal state is `* -> superseded`). Re-dispatching a terminal item would mean inventing a transition the DAG forbids; lazyspec would gate-reject it and the claim would be dropped anyway.
+- It is what the stories promise. STORY-007 AC3: "Given the item is no longer active, When the timer fires, Then the claim is released without re-dispatch." STORY-009 AC1 says the same for an item absent from candidates. A terminal item is the "no longer active" case.
+- The fire still *resolves*: claim released, durable retry entry cleared. BUG-002's symptom is the claim being held indefinitely, and release cures it. "Re-dispatches without operator action" is the promise for an item that is still live, not for one lazyspec says is finished.
+
+Attempt escalation across re-dispatches (AC2) therefore rides the **active** arm, not the terminal one. A failed run whose advance to the failure target is gate-rejected — which is the shipped case here, since `in-progress -> rejected` has no edge — leaves the item in the active state, so its backoff fires, re-dispatches, and escalates. A project whose mapping does land failures in a dispatch role gets the same escalation through the dispatch arm.
+
+The fire decision by role, from `lookup_doc` + `RoleMapping::classify` (the seam `reconcile_running` uses):
+
+| lookup | role | action |
+| --- | --- | --- |
+| `Present` | `Active` | re-dispatch, no advance — the item is already in the active state (stall case, and gate-rejected failure) |
+| `Present` | `Dispatch` | re-dispatch through the normal claim-and-activate path |
+| `Present` | `Terminal` or unmapped | release the claim, clear the retry entry |
+| `Absent` | — | release the claim, clear the retry entry |
+| `Err` | — | requeue, leave the schedule untouched (STORY-009 AC4) |
+
+Re-dispatchable but no free slot requeues with "no available orchestrator slots" (STORY-009 AC3).
 
 ## Tasks
 1. First, fix the fakes so they model reality: a continuation retry's item is in the success target, a backoff retry's item is in the failure target, a stall retry's item is still in the active state. Confirm the existing retry tests now fail — that failure is BUG-002's second defect.
@@ -41,4 +62,6 @@ Wire due-retry firing into the daemon's orchestrator loop and reshape the handle
 ## Out of scope
 - The agent-process kill (BUG-003 / its own iteration).
 - Per-tick reconcile ordering, the progress-event storm, and the `dispatch_error` socket surface — chunk-review nits, handled separately.
+
+
 

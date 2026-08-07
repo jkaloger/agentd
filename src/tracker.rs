@@ -80,6 +80,13 @@ pub trait Tracker {
     /// a claim for an absent doc but stays conservative on a read failure.
     fn lookup_doc(&self, id: &str) -> Result<DocLookup, TrackerError>;
 
+    /// Resolve one document by id into a dispatch payload. `fetch_dispatchable`
+    /// answers "what may be dispatched now" and so offers dispatch-role documents
+    /// only; a fired retry already knows *which* item it is re-dispatching and
+    /// that item is never in a dispatch role at fire time (BUG-002), so it asks
+    /// here instead.
+    fn fetch_candidate(&self, id: &str) -> Result<Candidate, TrackerError>;
+
     /// Move a document to `target_state` through lazyspec's gated lifecycle
     /// (the daemon owns transitions, per ADR-003). Modelled as
     /// `lazyspec update <id> --status <target>`.
@@ -163,6 +170,11 @@ impl<R: CommandRunner> Tracker for LazyspecTracker<R> {
             Err(CliFailure::Exit { stderr, .. }) if is_not_found(&stderr) => Ok(DocLookup::Absent),
             Err(failure) => Err(failure.into()),
         }
+    }
+
+    fn fetch_candidate(&self, id: &str) -> Result<Candidate, TrackerError> {
+        let shown = self.runner.run(&["show", id, "--json"])?;
+        parse_candidate(id, &shown)
     }
 
     fn advance(&self, id: &str, target_state: &str) -> Result<(), TrackerError> {
@@ -258,6 +270,27 @@ fn parse_body(json: &[u8]) -> Result<String, TrackerError> {
     Ok(shown.body)
 }
 
+/// Normalize `lazyspec show <id> --json` into a `Candidate`. The show payload
+/// carries everything the listing does plus the body, so it flows through the
+/// same `normalize` the listing path uses and yields an identical shape.
+fn parse_candidate(id: &str, json: &[u8]) -> Result<Candidate, TrackerError> {
+    let shown: ShownDoc = serde_json::from_slice(json).map_err(TrackerError::Parse)?;
+    let normalized = normalize(CompleteDoc {
+        id: id.to_string(),
+        path: shown.path,
+        title: shown.title,
+        status: shown.status,
+        doc_type: shown.doc_type,
+        related: shown.related,
+        attributes: shown.attributes,
+        date: shown.date,
+    });
+    Ok(Candidate {
+        body: shown.body,
+        ..normalized
+    })
+}
+
 fn parse_doc_view(id: &str, json: &[u8]) -> Result<DocView, TrackerError> {
     let shown: ShownDoc = serde_json::from_slice(json).map_err(TrackerError::Parse)?;
     Ok(DocView {
@@ -349,6 +382,14 @@ struct ShownDoc {
     body: String,
     #[serde(default)]
     status: String,
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    related: Vec<RawRelation>,
+    #[serde(default)]
+    attributes: HashMap<String, serde_json::Value>,
+    #[serde(default)]
+    date: String,
 }
 
 #[derive(Debug)]
@@ -571,6 +612,44 @@ mod tests {
             "an empty attributes map yields no priority"
         );
         assert_eq!(candidates[1].created_at, "2026-07-11");
+    }
+
+    // BUG-002: a fired retry resolves its own item by id, so `fetch_candidate`
+    // must yield the same shape the listing path does — identifier, parent and
+    // dependencies included — for a document no dispatch listing would offer.
+    #[test]
+    fn fetch_candidate_normalizes_a_non_dispatch_document_by_id() {
+        let tracker = LazyspecTracker::new(
+            FakeCli::ok(r#"{"documents":[]}"#).with_body(
+                "ITERATION-014",
+                r#"{"id":"ITERATION-014","path":"docs/iterations/ITERATION-014-execute-one-iteration.md",
+                    "title":"Execute one iteration","status":"in-progress","type":"iteration",
+                    "related":[{"target":"STORY-060","type":"implements"},
+                               {"target":"ITERATION-013","type":"blocked-by"}],
+                    "attributes":{"priority":2},"date":"2026-07-13","body":"Objective: prove the path."}"#,
+            ),
+            RoleMapping::adr003_default(),
+        );
+
+        let candidate = tracker.fetch_candidate("ITERATION-014").unwrap();
+
+        assert_eq!(candidate.identifier, "execute-one-iteration");
+        assert_eq!(candidate.title, "Execute one iteration");
+        assert_eq!(candidate.body, "Objective: prove the path.");
+        assert_eq!(
+            candidate.state, "in-progress",
+            "an active document is resolvable by id even though it is not dispatch-eligible"
+        );
+        assert_eq!(candidate.parent.as_deref(), Some("STORY-060"));
+        assert_eq!(
+            candidate.dependencies,
+            vec![DependencyRef {
+                target: "ITERATION-013".to_string(),
+                kind: DependencyKind::BlockedBy,
+            }]
+        );
+        assert_eq!(candidate.priority, Some(2));
+        assert_eq!(candidate.created_at, "2026-07-13");
     }
 
     #[test]

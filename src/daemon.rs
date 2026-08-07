@@ -18,8 +18,9 @@ use crate::projection::{EventKind, Projection, Snapshot};
 use crate::prompt;
 use crate::store::Store;
 use crate::tick::{
-    DispatchOutcome, RunRecord, RunningAction, RunningView, SkipClaim, TickReport, WorkerCompletion,
-    dispatch_one, finalize, reconcile, reconcile_running, run_worker,
+    Dispatch, DispatchOutcome, RetryFire, RunRecord, RunningAction, RunningView, SkipClaim,
+    TickReport, WorkerCompletion, dispatch_one, finalize, fire_due_retries, reconcile,
+    reconcile_running, run_worker,
 };
 use crate::tracker::Tracker;
 use crate::workspace::{DiskWorktrees, remove_worktree};
@@ -398,37 +399,113 @@ where
             match config::load(&config_path) {
                 Ok(config) => {
                     worker_state.lock().unwrap().dispatch_error = None;
-                    // Fill free slots (ADR-007/ADR-008): dispatch up to
-                    // `max_concurrent` minus the live workers, in priority order,
-                    // spawning a worker per claim without awaiting its turn. Once no
-                    // eligible candidate remains (`dispatch_one` skips live-claimed
-                    // ids, so consecutive calls select distinct candidates), the pass
-                    // stops and its report is mirrored.
-                    //
                     // The active state a claimed worker will occupy (ADR-008); the
                     // per-status cap (STORY-006) tallies live workers against it.
                     let active_state = config.transitions.claim.to_lowercase();
-                    let slots = (config.max_concurrent as usize)
-                        .saturating_sub(worker_state.lock().unwrap().live_worker_count());
-                    for _ in 0..slots {
-                        // Skip a candidate whose active state is already at its
-                        // configured cap, reading the live registry so a within-tick
-                        // burst counts too (a just-dispatched worker is pushed before
-                        // the next call). No cap for the state means the global slot
-                        // count alone governs (AC2).
-                        let at_status_cap = |state: &str| match config.per_status_caps.get(state) {
-                            Some(&cap) => {
-                                let running = worker_state
-                                    .lock()
-                                    .unwrap()
-                                    .running
-                                    .iter()
-                                    .filter(|item| item.state == state)
-                                    .count();
-                                running as u32 >= cap
-                            }
-                            None => false,
-                        };
+                    let live_workers = || worker_state.lock().unwrap().live_worker_count();
+                    // Whether the active state is already at its configured cap,
+                    // read off the live registry so a within-tick burst counts too
+                    // (a just-spawned worker is pushed before the next call). No cap
+                    // for the state means the global slot count alone governs (AC2).
+                    let at_status_cap = |state: &str| match config.per_status_caps.get(state) {
+                        Some(&cap) => {
+                            let running = worker_state
+                                .lock()
+                                .unwrap()
+                                .running
+                                .iter()
+                                .filter(|item| item.state == state)
+                                .count();
+                            running as u32 >= cap
+                        }
+                        None => false,
+                    };
+                    let is_running = |id: &str| {
+                        worker_state
+                            .lock()
+                            .unwrap()
+                            .running
+                            .iter()
+                            .any(|item| item.id == id)
+                    };
+                    let spawn_worker = |dispatch: Dispatch| {
+                        let id = dispatch.candidate.id.clone();
+                        let identifier = dispatch.candidate.identifier.clone();
+                        let attempt = dispatch.attempt;
+                        let started_at_ms = now_ms();
+                        // The worktree `run_worker` will prepare for this run
+                        // (ADR-005): its deterministic path, held so a terminal
+                        // reconcile can clean it (STORY-010 AC1).
+                        let worktree = repo.join(&config.workspace.root).join(&id);
+                        let worker_tracker = tracker.clone();
+                        let worker_adapter = adapter.clone();
+                        let worker_config = config.clone();
+                        let worker_template = template.clone();
+                        let worker_repo = repo.clone();
+                        let tx = completion_tx.clone();
+                        let progress = progress_tx.clone();
+                        let progress_id = id.clone();
+                        let handle = tokio::spawn(async move {
+                            let on_progress = move || {
+                                let _ = progress.send((progress_id.clone(), now_ms()));
+                            };
+                            let completion = run_worker(
+                                worker_tracker.as_ref(),
+                                worker_adapter.as_ref(),
+                                &worker_config,
+                                &worker_template,
+                                &worker_repo,
+                                dispatch,
+                                &on_progress,
+                            )
+                            .await;
+                            let _ = tx.send(completion);
+                        });
+                        // Published before this returns, so the very next slot
+                        // decision — the fire pass's or the dispatch pass's — already
+                        // counts this worker (ADR-007/ADR-008).
+                        worker_state.lock().unwrap().running.push(RunningItem {
+                            id,
+                            identifier,
+                            state: active_state.clone(),
+                            started_at_ms,
+                            worktree,
+                            handle,
+                            last_event_at_ms: None,
+                            attempt,
+                        });
+                    };
+
+                    // Consume the retry schedules this daemon writes (BUG-002):
+                    // a continuation, a failure backoff, and a stall retry all come
+                    // due here and nowhere else. A due retry is a dispatch that
+                    // already carries an attempt, so it competes for the same slots
+                    // ahead of fresh work — firing first keeps a saturated backlog
+                    // from starving the retries the daemon itself scheduled.
+                    match fire_due_retries(
+                        tracker.as_ref(),
+                        &store,
+                        &config,
+                        now,
+                        HOLDER,
+                        live_workers,
+                        at_status_cap,
+                        is_running,
+                        spawn_worker,
+                    ) {
+                        Ok(fires) => clear_resolved_queued(&worker_state, &fires),
+                        Err(e) => eprintln!("agentd: warning: {e}"),
+                    }
+
+                    // Fill the free slots (ADR-007/ADR-008): dispatch in priority
+                    // order, spawning a worker per claim without awaiting its turn,
+                    // until no eligible candidate remains (`dispatch_one` skips
+                    // live-claimed ids, so consecutive calls select distinct
+                    // candidates) and the pass's report is mirrored. The free-slot
+                    // count is re-read from the registry each pass rather than
+                    // snapshotted once, so `max_concurrent` holds over every worker
+                    // this tick spawned — a fired retry's included.
+                    while live_workers() < config.max_concurrent as usize {
                         match dispatch_one(
                             tracker.as_ref(),
                             &store,
@@ -439,50 +516,7 @@ where
                             at_status_cap,
                             |id: &str| suppressed.contains(id),
                         ) {
-                            DispatchOutcome::Dispatched(dispatch) => {
-                                let id = dispatch.candidate.id.clone();
-                                let identifier = dispatch.candidate.identifier.clone();
-                                let attempt = dispatch.attempt;
-                                let started_at_ms = now_ms();
-                                // The worktree `run_worker` will prepare for this run
-                                // (ADR-005): its deterministic path, held so a
-                                // terminal reconcile can clean it (STORY-010 AC1).
-                                let worktree = repo.join(&config.workspace.root).join(&id);
-                                let worker_tracker = tracker.clone();
-                                let worker_adapter = adapter.clone();
-                                let worker_config = config.clone();
-                                let worker_template = template.clone();
-                                let worker_repo = repo.clone();
-                                let tx = completion_tx.clone();
-                                let progress = progress_tx.clone();
-                                let progress_id = id.clone();
-                                let handle = tokio::spawn(async move {
-                                    let on_progress = move || {
-                                        let _ = progress.send((progress_id.clone(), now_ms()));
-                                    };
-                                    let completion = run_worker(
-                                        worker_tracker.as_ref(),
-                                        worker_adapter.as_ref(),
-                                        &worker_config,
-                                        &worker_template,
-                                        &worker_repo,
-                                        dispatch,
-                                        &on_progress,
-                                    )
-                                    .await;
-                                    let _ = tx.send(completion);
-                                });
-                                worker_state.lock().unwrap().running.push(RunningItem {
-                                    id,
-                                    identifier,
-                                    state: active_state.clone(),
-                                    started_at_ms,
-                                    worktree,
-                                    handle,
-                                    last_event_at_ms: None,
-                                    attempt,
-                                });
-                            }
+                            DispatchOutcome::Dispatched(dispatch) => spawn_worker(dispatch),
                             DispatchOutcome::NoDispatch(report) => {
                                 // A gate refusal suppresses the id for this daemon's
                                 // lifetime so later ticks neither re-claim nor re-log
@@ -609,9 +643,23 @@ fn handle_completion(
     max_retry_backoff_ms: u64,
 ) {
     // A clean turn does not finalize (ADR-004): `run_worker` retains the claim
-    // (`release_claim` false) rather than releasing it. Read the flag before
-    // `finalize` consumes the completion so the continuation can be scheduled.
+    // (`release_claim` false) rather than releasing it. Read the flag and the run's
+    // own attempt before `finalize` consumes the completion — the retry scheduled
+    // below is a function of both.
     let clean = !completion.release_claim;
+    let attempt = completion.attempt;
+    // Whether the daemon still owns this run (ITERATION-039 task 7): the completion
+    // may be arriving after `stop_running` already dropped the worker and its caller
+    // released the claim — a stall kill or a terminal reconcile racing the turn's
+    // last moment. The registry is the ownership record, so an id it no longer holds
+    // earns no continuation below; the item is not this daemon's to bring back, and
+    // the schedule would outlive the released claim.
+    let owned = state
+        .lock()
+        .unwrap()
+        .running
+        .iter()
+        .any(|item| item.id == completion.record.id);
     let record = finalize(store, completion);
     // Post-commit seam (ADR-002): the claim/advance already committed durably;
     // this only best-effort mirrors that outcome to the plain-text log/snapshot.
@@ -637,35 +685,35 @@ fn handle_completion(
     }
 
     // A clean exit is a continuation, not a finalize (STORY-007 AC1): the claim
-    // stays held and a durable attempt-1 retry is scheduled ~1s out. The fire
-    // handler (ITERATION-031) consumes it to re-dispatch while the doc is active
-    // or release otherwise; nothing here reads, releases, or re-dispatches.
+    // stays held and a durable retry is scheduled ~1s out. The fire handler
+    // consumes it to re-dispatch while the doc is active or release otherwise;
+    // nothing here reads, releases, or re-dispatches.
     //
     // A failed exit released its claim; schedule an exponential backoff retry
-    // (STORY-008 AC1/AC2). The attempt is the prior schedule's + 1, else the first
-    // failure is attempt 1; `schedule_retry` replaces any prior entry for the id,
-    // so exactly one durable schedule remains. These branches are mutually
-    // exclusive: a clean exit never schedules a backoff, a failed one never a
-    // continuation.
+    // (STORY-008 AC1/AC2). Both record the attempt that just ran — the fire starts
+    // the next one — so a re-dispatched run's backoff escalates from what it was
+    // rather than from the durable entry that fire has already cleared (BUG-002).
+    // `schedule_retry` replaces any prior entry for the id, so exactly one durable
+    // schedule remains. These branches are mutually exclusive: a clean exit never
+    // schedules a backoff, a failed one never a continuation.
     let mut retry = None;
-    if clean {
-        let _ = store.schedule_retry(&record.id, 1, "", now_ms() + CONTINUATION_RETRY_MS);
-    } else {
-        let attempt = store
-            .retries()
-            .ok()
-            .and_then(|entries| entries.into_iter().find(|(id, _)| *id == record.id))
-            .map_or(1, |(_, prior)| prior.attempt + 1);
+    if !clean {
         let error = record.failure_detail().to_string();
         let due_at = now_ms() + retry_backoff_ms(attempt, max_retry_backoff_ms);
         let _ = store.schedule_retry(&record.id, attempt, &error, due_at);
         retry = Some((attempt, error));
+    } else if owned {
+        schedule_continuation(store, &record.id, attempt);
     }
 
     let mut state = state.lock().unwrap();
     state.running.retain(|item| item.id != record.id);
+    // Whatever retry brought this run here is resolved by it, so its `queued` row
+    // goes with it (AC5): a fresh failure re-adds one below, a clean exit leaves
+    // none. Without this a re-dispatched run's row would outlive the retry it
+    // mirrors and status would show the item queued forever.
+    state.queued.retain(|q| q.id != record.id);
     if let Some((attempt, error)) = retry {
-        state.queued.retain(|q| q.id != record.id);
         state.queued.push(QueuedRetry {
             id: record.id.clone(),
             identifier: record.identifier.clone(),
@@ -675,6 +723,40 @@ fn handle_completion(
         });
     }
     state.records.push(record);
+}
+
+/// Drop the `queued` rows a fire pass resolved (AC5): a re-dispatched item is
+/// running now and a released one is finished, so neither is still waiting on a
+/// retry. A requeued or deferred retry is still pending and keeps its row, which
+/// is what the operator needs to see.
+fn clear_resolved_queued(state: &SharedState, fires: &[RetryFire]) {
+    let resolved: Vec<&str> = fires
+        .iter()
+        .filter_map(|fire| match fire {
+            RetryFire::Redispatched(id) | RetryFire::Released(id) => Some(id.as_str()),
+            RetryFire::Requeued(_) | RetryFire::Deferred(_) => None,
+        })
+        .collect();
+    if resolved.is_empty() {
+        return;
+    }
+    let mut state = state.lock().unwrap();
+    state.queued.retain(|q| !resolved.contains(&q.id.as_str()));
+}
+
+/// Schedule the continuation a clean turn earns (STORY-007 AC1), unless the item
+/// already has a retry pending. `schedule_retry` upserts, so writing one
+/// unconditionally would erase a backoff or stall retry the same id is waiting on
+/// — its attempt and its delay both (BUG-002); the pending schedule already brings
+/// the item back, and it carries the real failure.
+fn schedule_continuation(store: &Store, id: &str, attempt: u32) {
+    let pending = store
+        .retries()
+        .is_ok_and(|entries| entries.iter().any(|(scheduled, _)| scheduled == id));
+    if pending {
+        return;
+    }
+    let _ = store.schedule_retry(id, attempt, "", now_ms() + CONTINUATION_RETRY_MS);
 }
 
 /// Reconcile the live in-flight workers against refreshed lazyspec state
@@ -757,9 +839,32 @@ async fn reconcile_running_workers<T: Tracker>(
             // (freeing the slot), release its claim, and queue a retry due now,
             // carrying the attempt. The tree is left on disk for inspection.
             RunningAction::TerminateAndRetry { attempt } => {
+                // The row's operator-facing fields, read off the registry entry
+                // before the stop drops it.
+                let stalled = state
+                    .lock()
+                    .unwrap()
+                    .running
+                    .iter()
+                    .find(|item| item.id == id)
+                    .map(|item| (item.identifier.clone(), item.started_at_ms));
                 stop_running(state, &id).await;
                 let _ = store.release(&id);
                 let _ = store.schedule_retry(&id, attempt, "stalled", now);
+                // A stall's durable schedule gets the same `queued` row the failure
+                // path writes (STORY-008 AC3, AC5): the item is waiting on a retry,
+                // not gone, so status must say so until the fire re-dispatches it.
+                if let Some((identifier, started_at_ms)) = stalled {
+                    let mut st = state.lock().unwrap();
+                    st.queued.retain(|q| q.id != id);
+                    st.queued.push(QueuedRetry {
+                        id: id.clone(),
+                        identifier,
+                        attempt,
+                        error: "stalled".to_string(),
+                        started_at_ms,
+                    });
+                }
                 let attempt_str = attempt.to_string();
                 projection.record(
                     now,
@@ -1065,6 +1170,7 @@ mod tests {
     use crate::agent::AgentEvent;
     use crate::config::load_str;
     use crate::mapping::StubDag;
+    use crate::store::RetryRecord;
     use crate::tracker::{Candidate, DocLookup, DocView, TrackerError};
     use crate::workspace::Worktree;
 
@@ -1095,6 +1201,10 @@ mod tests {
                 return Ok(DocLookup::Present(self.parent.clone()));
             }
             Ok(DocLookup::Present(active_iteration(id)))
+        }
+
+        fn fetch_candidate(&self, _id: &str) -> Result<Candidate, TrackerError> {
+            Ok(self.candidate.clone())
         }
 
         fn advance(&self, _id: &str, _target: &str) -> Result<(), TrackerError> {
@@ -1140,6 +1250,17 @@ mod tests {
                 return Ok(DocLookup::Present(self.parent.clone()));
             }
             Ok(DocLookup::Present(active_iteration(id)))
+        }
+
+        fn fetch_candidate(&self, id: &str) -> Result<Candidate, TrackerError> {
+            self.candidates
+                .iter()
+                .find(|c| c.id == id)
+                .cloned()
+                .ok_or_else(|| TrackerError::Command {
+                    code: Some(1),
+                    stderr: format!("document {id} not found"),
+                })
         }
 
         fn advance(&self, _id: &str, _target: &str) -> Result<(), TrackerError> {
@@ -1206,6 +1327,10 @@ mod tests {
                 return Ok(DocLookup::Present(self.parent.clone()));
             }
             Ok(DocLookup::Present(active_iteration(id)))
+        }
+
+        fn fetch_candidate(&self, _id: &str) -> Result<Candidate, TrackerError> {
+            Ok(self.candidate.clone())
         }
 
         fn advance(&self, _id: &str, target: &str) -> Result<(), TrackerError> {
@@ -1399,6 +1524,54 @@ mod tests {
     fn failing_blocking_adapter() -> (FailingBlockingAdapter, Arc<Notify>) {
         let gate = Arc::new(Notify::new());
         (FailingBlockingAdapter { gate: gate.clone() }, gate)
+    }
+
+    /// An adapter whose first turn hangs until the test releases it — long enough
+    /// for the stall check to kill it — and whose every later turn completes at
+    /// once. Each report names the turn that produced it, so a recorded run says
+    /// which dispatch reached the agent rather than merely when it started.
+    struct StallThenCompleteAdapter {
+        turns: Arc<AtomicUsize>,
+        gate: Arc<Notify>,
+    }
+
+    impl AgentAdapter for StallThenCompleteAdapter {
+        type Session = Worktree;
+
+        fn start_session(&self, worktree: Worktree) -> Worktree {
+            worktree
+        }
+
+        async fn run_turn(
+            &self,
+            _session: &Worktree,
+            _prompt: &str,
+            on_progress: &(dyn Fn() + Send + Sync),
+        ) -> TurnReport {
+            let turn = self.turns.fetch_add(1, Ordering::SeqCst) + 1;
+            on_progress();
+            if turn == 1 {
+                self.gate.notified().await;
+            }
+            TurnReport {
+                outcome: TurnOutcome::Completed,
+                events: vec![AgentEvent::TurnCompleted {
+                    pid: turn as u32,
+                    at_ms: 1,
+                }],
+            }
+        }
+    }
+
+    fn stall_then_complete_adapter() -> (StallThenCompleteAdapter, Arc<Notify>) {
+        let gate = Arc::new(Notify::new());
+        (
+            StallThenCompleteAdapter {
+                turns: Arc::new(AtomicUsize::new(0)),
+                gate: gate.clone(),
+            },
+            gate,
+        )
     }
 
     /// The sandbox denies `AF_UNIX` bind (Operation not permitted). Socket
@@ -1705,6 +1878,274 @@ mod tests {
         assert!(entries[0].1.due_at > 0);
     }
 
+    /// A tracker whose one document carries real, mutable status: `advance` moves
+    /// it, `lookup_doc` reports where it now sits, and it is offered as a candidate
+    /// only while it still sits in its dispatch state. So a second run for the id
+    /// can only have come from a fired retry — the dispatch listing never offers a
+    /// claimed item twice.
+    struct StatusTracker {
+        candidate: Candidate,
+        parent: DocView,
+        status: Arc<Mutex<String>>,
+        fetches: Arc<AtomicUsize>,
+    }
+
+    impl Tracker for StatusTracker {
+        fn fetch_dispatchable(&self) -> Result<Vec<Candidate>, TrackerError> {
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            if *self.status.lock().unwrap() != self.candidate.state {
+                return Ok(Vec::new());
+            }
+            Ok(vec![self.candidate.clone()])
+        }
+
+        fn fetch_doc(&self, _id: &str) -> Result<DocView, TrackerError> {
+            Ok(self.parent.clone())
+        }
+
+        fn lookup_doc(&self, id: &str) -> Result<DocLookup, TrackerError> {
+            if id == self.parent.id {
+                return Ok(DocLookup::Present(self.parent.clone()));
+            }
+            Ok(DocLookup::Present(DocView {
+                id: id.to_string(),
+                doc_type: "iteration".to_string(),
+                title: String::new(),
+                body: String::new(),
+                status: self.status.lock().unwrap().clone(),
+            }))
+        }
+
+        fn fetch_candidate(&self, _id: &str) -> Result<Candidate, TrackerError> {
+            Ok(self.candidate.clone())
+        }
+
+        fn advance(&self, _id: &str, target: &str) -> Result<(), TrackerError> {
+            *self.status.lock().unwrap() = target.to_string();
+            Ok(())
+        }
+    }
+
+    /// A `StatusTracker` over one accepted iteration under a terminal parent, plus
+    /// handles to the document's live status and the per-tick fetch counter.
+    fn status_tracker() -> (StatusTracker, Arc<Mutex<String>>, Arc<AtomicUsize>) {
+        let status = Arc::new(Mutex::new("accepted".to_string()));
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let tracker = StatusTracker {
+            candidate: Candidate {
+                id: "ITER-001".to_string(),
+                identifier: "fire-due-retries".to_string(),
+                title: "Fire due retries from the daemon loop".to_string(),
+                body: "Objective: prove the loop consumes its own schedules.".to_string(),
+                state: "accepted".to_string(),
+                parent: Some("STORY-060".to_string()),
+                dependencies: Vec::new(),
+                priority: None,
+                created_at: "2026-08-06".to_string(),
+            },
+            parent: DocView {
+                id: "STORY-060".to_string(),
+                doc_type: "story".to_string(),
+                title: "Concurrency substrate".to_string(),
+                body: "As the daemon, I run tracked concurrent workers.".to_string(),
+                status: "complete".to_string(),
+            },
+            status: status.clone(),
+            fetches: fetches.clone(),
+        };
+        (tracker, status, fetches)
+    }
+
+    /// Wait for two further tick fetches, so at least one whole tick — its retry
+    /// fire included — has run since the caller's last observation.
+    async fn wait_for_two_more_ticks(fetches: &Arc<AtomicUsize>) {
+        let target = fetches.load(Ordering::SeqCst) + 2;
+        wait_for_fetches(fetches, target).await;
+    }
+
+    // BUG-002 / STORY-007: the continuation a clean exit schedules is consumed by a
+    // tick with no operator action. The clean turn advanced the doc to the success
+    // target, so the fire reads it as finished and resolves it — releasing the claim
+    // the clean exit deliberately held, instead of holding it for the daemon's life.
+    #[tokio::test]
+    async fn a_clean_exits_continuation_is_fired_by_a_later_tick() {
+        let (_repo, config_path, _socket) = init_project("");
+        let store_dir = config_path.parent().unwrap().to_path_buf();
+        let (adapter, gate) = blocking_adapter();
+        let (tracker, status, fetches) = status_tracker();
+        let mut config = load_str("").unwrap();
+        config.poll_interval_ms = 5;
+        let orch = spawn_orchestrator(&config_path, config, tracker, adapter);
+        let state = orch.state.clone();
+
+        wait_for_running(&state).await;
+        gate.notify_one();
+        wait_for_records(&state, 1).await;
+        assert_eq!(
+            *status.lock().unwrap(),
+            "complete",
+            "a clean turn advances the doc to the success target"
+        );
+
+        tokio::time::sleep(Duration::from_millis(CONTINUATION_RETRY_MS + 50)).await;
+        wait_for_two_more_ticks(&fetches).await;
+        assert_eq!(
+            state.lock().unwrap().records.len(),
+            1,
+            "a finished item's continuation resolves it, it does not run it again"
+        );
+
+        drain_all(orch, &gate).await;
+
+        let store = Store::open(&store_dir.join("store.redb")).unwrap();
+        assert!(
+            store.get("ITER-001").unwrap().is_none(),
+            "the fired continuation releases the claim the clean exit held"
+        );
+        assert!(
+            store.retries().unwrap().is_empty(),
+            "the fired continuation clears its durable schedule"
+        );
+    }
+
+    // BUG-002 / STORY-008: the backoff a failed exit schedules comes due and is
+    // consumed by a tick. The failed turn advanced the doc to the failure target, so
+    // the fire resolves it rather than leaving the schedule to accumulate in redb.
+    #[tokio::test]
+    async fn a_failed_exits_backoff_is_fired_once_its_delay_elapses() {
+        let (_repo, config_path, _socket) = init_project("");
+        let store_dir = config_path.parent().unwrap().to_path_buf();
+        let (adapter, gate) = failing_blocking_adapter();
+        let (tracker, status, fetches) = status_tracker();
+        let mut config = load_str("").unwrap();
+        config.poll_interval_ms = 5;
+        // The whole backoff, so the retry comes due inside the test rather than the
+        // ten seconds a default-configured daemon waits.
+        config.max_retry_backoff_ms = 50;
+        let orch = spawn_orchestrator(&config_path, config, tracker, adapter);
+        let state = orch.state.clone();
+
+        wait_for_running(&state).await;
+        gate.notify_one();
+        wait_for_records(&state, 1).await;
+        assert_eq!(
+            *status.lock().unwrap(),
+            "rejected",
+            "a failed turn advances the doc to the failure target"
+        );
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        wait_for_two_more_ticks(&fetches).await;
+
+        drain_all(orch, &gate).await;
+
+        let store = Store::open(&store_dir.join("store.redb")).unwrap();
+        assert!(
+            store.retries().unwrap().is_empty(),
+            "the fired backoff clears its durable schedule"
+        );
+        assert!(store.get("ITER-001").unwrap().is_none());
+    }
+
+    // BUG-002 / STORY-011: the retry a stall kill schedules is fired by the next
+    // tick, so a stall-killed item is re-dispatched rather than stranded in its
+    // active state. The aborted first worker never reports, and the dispatch listing
+    // stopped offering the item the moment it was claimed, so a recorded run can
+    // only have come from the fire. The re-dispatch prepares an id whose tree the
+    // stall kill deliberately kept, so it must reach the agent in that tree and
+    // produce its outcome — starting later is not the same as running.
+    #[tokio::test]
+    async fn a_stall_killed_item_is_re_dispatched_by_its_fired_retry() {
+        let (_repo, config_path, _socket) = init_project("");
+        let (adapter, gate) = stall_then_complete_adapter();
+        let (tracker, status, _fetches) = status_tracker();
+        let mut config = load_str("").unwrap();
+        config.poll_interval_ms = 5;
+        config.stall_timeout_ms = 50;
+        let orch = spawn_orchestrator(&config_path, config, tracker, adapter);
+        let state = orch.state.clone();
+
+        wait_for_running(&state).await;
+        let stalled_started_at = state.lock().unwrap().running[0].started_at_ms;
+        assert_eq!(
+            *status.lock().unwrap(),
+            "in-progress",
+            "a stall-killed item is still in its active state at fire time"
+        );
+
+        wait_for_records(&state, 1).await;
+        let record = {
+            let state = state.lock().unwrap();
+            state
+                .records
+                .iter()
+                .find(|r| r.id == "ITER-001")
+                .expect("the re-dispatched run must be recorded")
+                .clone()
+        };
+
+        assert!(
+            record.started_at_ms > stalled_started_at,
+            "the recorded run must be the fired retry's, not the aborted stalled one"
+        );
+        assert_eq!(
+            record.events,
+            vec![AgentEvent::TurnCompleted { pid: 2, at_ms: 1 }],
+            "the re-dispatched run must reach the agent — the second turn — and carry its report"
+        );
+        assert_eq!(
+            record.outcome,
+            TurnOutcome::Completed,
+            "the re-dispatch must produce its own outcome, not die preparing its workspace"
+        );
+        assert_eq!(
+            record.transition.map(|t| t.target_state),
+            Some("complete".to_string()),
+            "the re-dispatched run's outcome resolves the item"
+        );
+
+        drain_all(orch, &gate).await;
+    }
+
+    // The fire consults the live registry, not the caps, when it asks whether an id
+    // is already taken: a retry coming due while a worker still holds the item is
+    // left to that worker. Without that guard the daemon's own live lease renews and
+    // a second worker lands on an item that already has one.
+    #[tokio::test]
+    async fn a_retry_due_while_the_item_runs_is_left_to_its_worker() {
+        let (_repo, config_path, _socket) = init_project("");
+        let store_dir = config_path.parent().unwrap().to_path_buf();
+        {
+            let store = Store::open(&store_dir.join("store.redb")).unwrap();
+            store
+                .schedule_retry("ITER-001", 2, "stalled", now_ms() + 150)
+                .unwrap();
+        }
+        let (adapter, gate) = blocking_adapter();
+        let (tracker, _status, fetches) = status_tracker();
+        let mut config = load_str("").unwrap();
+        config.poll_interval_ms = 5;
+        let orch = spawn_orchestrator(&config_path, config, tracker, adapter);
+        let state = orch.state.clone();
+
+        wait_for_running(&state).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        wait_for_two_more_ticks(&fetches).await;
+        assert_eq!(
+            state
+                .lock()
+                .unwrap()
+                .running
+                .iter()
+                .filter(|item| item.id == "ITER-001")
+                .count(),
+            1,
+            "a due retry must not put a second worker on an item a worker already holds"
+        );
+
+        drain_all(orch, &gate).await;
+    }
+
     async fn wait_for_advances(advances: &Arc<AtomicUsize>, n: usize) {
         for _ in 0..400 {
             if advances.load(Ordering::SeqCst) >= n {
@@ -1773,10 +2214,10 @@ mod tests {
         assert_eq!(retry_backoff_ms(u32::MAX, max), max);
     }
 
-    /// A failed `WorkerCompletion` for `id` whose turn reported `reason`, with its
-    /// claim released — the released-claim path `handle_completion` schedules a
-    /// backoff retry for.
-    fn failed_completion(id: &str, reason: &str) -> WorkerCompletion {
+    /// A failed `WorkerCompletion` for `id` whose turn reported `reason` on its
+    /// `attempt`-th run, with its claim released — the released-claim path
+    /// `handle_completion` schedules a backoff retry for.
+    fn failed_completion(id: &str, reason: &str, attempt: u32) -> WorkerCompletion {
         WorkerCompletion {
             record: RunRecord {
                 id: id.to_string(),
@@ -1797,7 +2238,17 @@ mod tests {
                 claim_released: false,
             },
             release_claim: true,
+            attempt,
         }
+    }
+
+    /// A clean `WorkerCompletion` for `id`'s `attempt`-th run: the turn completed,
+    /// so the claim is retained and `handle_completion` schedules a continuation.
+    fn clean_completion(id: &str, attempt: u32) -> WorkerCompletion {
+        let mut completion = failed_completion(id, "", attempt);
+        completion.record.outcome = TurnOutcome::Completed;
+        completion.release_claim = false;
+        completion
     }
 
     // STORY-008 AC1/AC2/AC3 (deterministic): handling a failed completion schedules
@@ -1815,7 +2266,7 @@ mod tests {
 
         let before = now_ms();
         handle_completion(
-            failed_completion("ITER-001", "boom"),
+            failed_completion("ITER-001", "boom", 1),
             &store,
             &projection,
             &snapshot,
@@ -1847,11 +2298,12 @@ mod tests {
         assert_eq!(views[0].attempt, Some(1));
         assert_eq!(views[0].error.as_deref(), Some("boom"));
 
-        // AC1/AC2: a second failure bumps to attempt 2 (backoff doubled) and the
-        // replace semantics leave exactly one durable entry and one queued view.
+        // AC1/AC2: a second failure — the attempt-2 run a fired retry started —
+        // records attempt 2 (backoff doubled) and the replace semantics leave
+        // exactly one durable entry and one queued view.
         let before = now_ms();
         handle_completion(
-            failed_completion("ITER-001", "boom again"),
+            failed_completion("ITER-001", "boom again", 2),
             &store,
             &projection,
             &snapshot,
@@ -1876,6 +2328,251 @@ mod tests {
             state.lock().unwrap().queued.len(),
             1,
             "the queued view is replaced, not duplicated"
+        );
+    }
+
+    /// The retry schedule persisted for `id`, or `None`.
+    fn pending_retry(store: &Store, id: &str) -> Option<RetryRecord> {
+        store
+            .retries()
+            .unwrap()
+            .into_iter()
+            .find(|(entry, _)| entry == id)
+            .map(|(_, record)| record)
+    }
+
+    // STORY-008 AC2 + BUG-002: the backoff escalates from the attempt that ran, not
+    // from the prior durable entry. A fired retry clears the entry it consumed
+    // before re-dispatching, so the attempt-2 run it starts finds redb empty for its
+    // id — reconstructing the attempt from the store would reset it to 1 and the
+    // delay would never grow across re-dispatches.
+    #[test]
+    fn a_re_dispatched_runs_failure_escalates_the_backoff_from_its_own_attempt() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(&dir.path().join("store.redb")).unwrap();
+        let projection = Projection::new(dir.path().join("log"));
+        let snapshot = Snapshot::new(dir.path().to_path_buf());
+        let state: SharedState = Arc::new(Mutex::new(DaemonState::default()));
+        let max = 3_600_000;
+
+        handle_completion(
+            failed_completion("ITER-001", "boom", 1),
+            &store,
+            &projection,
+            &snapshot,
+            &state,
+            max,
+        );
+        store.clear_retry("ITER-001").unwrap();
+
+        let before = now_ms();
+        handle_completion(
+            failed_completion("ITER-001", "boom again", 2),
+            &store,
+            &projection,
+            &snapshot,
+            &state,
+            max,
+        );
+
+        let retry = pending_retry(&store, "ITER-001").unwrap();
+        assert_eq!(
+            retry.attempt, 2,
+            "the failure is the attempt that ran, not a fresh attempt 1"
+        );
+        assert!(
+            retry.due_at >= before + 2 * BASE_RETRY_BACKOFF_MS,
+            "the re-dispatched attempt's backoff must double rather than reset: {} vs {}",
+            retry.due_at,
+            before + 2 * BASE_RETRY_BACKOFF_MS
+        );
+        assert_eq!(
+            state.lock().unwrap().queued[0].attempt,
+            2,
+            "status must surface the escalated attempt"
+        );
+    }
+
+    // BUG-002: `schedule_retry` upserts, so an unconditional attempt-1 continuation
+    // erases a backoff or stall retry pending for the same id — resetting both its
+    // attempt and its delay. A clean exit whose id already has a schedule (the
+    // completion racing a stall kill's immediate retry) leaves it alone.
+    #[tokio::test]
+    async fn a_clean_completion_does_not_clobber_a_pending_retry() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(&dir.path().join("store.redb")).unwrap();
+        let projection = Projection::new(dir.path().join("log"));
+        let snapshot = Snapshot::new(dir.path().to_path_buf());
+        let state: SharedState = Arc::new(Mutex::new(DaemonState::default()));
+        // Still tracked, so it is the pending schedule — not the ownership guard —
+        // that decides here.
+        state
+            .lock()
+            .unwrap()
+            .running
+            .push(running_item_for("ITER-001", dir.path().join("tree")));
+        let due_at = now_ms() + 4 * BASE_RETRY_BACKOFF_MS;
+        store
+            .schedule_retry("ITER-001", 3, "stalled", due_at)
+            .unwrap();
+
+        handle_completion(
+            clean_completion("ITER-001", 3),
+            &store,
+            &projection,
+            &snapshot,
+            &state,
+            3_600_000,
+        );
+
+        let retry = pending_retry(&store, "ITER-001").unwrap();
+        assert_eq!(retry.attempt, 3, "the pending attempt must survive");
+        assert_eq!(retry.error, "stalled");
+        assert_eq!(
+            retry.due_at, due_at,
+            "the pending delay must survive: a continuation must not pull it forward"
+        );
+    }
+
+    // BUG-002 AC5: the run a fired retry re-dispatched carries the queued row that
+    // retry left behind. A clean exit resolves it, so the row must go — otherwise a
+    // finished item stays "Queued" in status for the daemon's life.
+    #[tokio::test]
+    async fn a_clean_completion_clears_the_queued_row_its_retry_left() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(&dir.path().join("store.redb")).unwrap();
+        let projection = Projection::new(dir.path().join("log"));
+        let snapshot = Snapshot::new(dir.path().to_path_buf());
+        let state: SharedState = Arc::new(Mutex::new(DaemonState::default()));
+        {
+            let mut st = state.lock().unwrap();
+            st.running
+                .push(running_item_for("ITER-001", dir.path().join("tree")));
+            st.queued.push(QueuedRetry {
+                id: "ITER-001".to_string(),
+                identifier: "iter-1".to_string(),
+                attempt: 2,
+                error: "boom".to_string(),
+                started_at_ms: 1_000,
+            });
+        }
+
+        handle_completion(
+            clean_completion("ITER-001", 3),
+            &store,
+            &projection,
+            &snapshot,
+            &state,
+            3_600_000,
+        );
+
+        assert!(
+            state.lock().unwrap().queued.is_empty(),
+            "the queued row the fired retry left must not survive the run it started"
+        );
+        assert_eq!(
+            pending_retry(&store, "ITER-001").map(|r| r.attempt),
+            Some(3),
+            "the clean exit still schedules its continuation"
+        );
+    }
+
+    // ITERATION-039 task 7: `stop_running` may have dropped the worker and its
+    // caller released the claim while the turn was reporting its last outcome. That
+    // late completion must not schedule a continuation — it would bring back an item
+    // this daemon no longer owns, against a claim it no longer holds.
+    #[tokio::test]
+    async fn a_completion_arriving_after_the_worker_was_stopped_schedules_no_continuation() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(&dir.path().join("store.redb")).unwrap();
+        let projection = Projection::new(dir.path().join("log"));
+        let snapshot = Snapshot::new(dir.path().to_path_buf());
+        let state: SharedState = Arc::new(Mutex::new(DaemonState::default()));
+        state
+            .lock()
+            .unwrap()
+            .running
+            .push(running_item_for("ITER-001", dir.path().join("tree")));
+
+        // The abort path: the worker leaves the registry and its claim is released.
+        stop_running(&state, "ITER-001").await;
+        let _ = store.release("ITER-001");
+
+        handle_completion(
+            clean_completion("ITER-001", 1),
+            &store,
+            &projection,
+            &snapshot,
+            &state,
+            3_600_000,
+        );
+
+        assert_eq!(
+            pending_retry(&store, "ITER-001"),
+            None,
+            "a completion for an item the daemon no longer tracks schedules nothing"
+        );
+        assert!(
+            state.lock().unwrap().queued.is_empty(),
+            "and it surfaces no queued row either"
+        );
+        assert_eq!(
+            state.lock().unwrap().records.len(),
+            1,
+            "the late completion is still recorded — it is not an error"
+        );
+    }
+
+    /// A `queued` row for `id`, as a producer would write it.
+    fn queued_row(id: &str) -> QueuedRetry {
+        QueuedRetry {
+            id: id.to_string(),
+            identifier: format!("iter-{id}"),
+            attempt: 2,
+            error: "boom".to_string(),
+            started_at_ms: 1_000,
+        }
+    }
+
+    // BUG-002 AC5: a fire pass resolves a retry either by re-dispatching the item or
+    // by releasing it — both end the wait, so both rows go. A requeued or deferred
+    // retry is still pending, so its row stays: that is what "waiting for a slot"
+    // looks like in status.
+    #[test]
+    fn a_fire_pass_clears_only_the_queued_rows_it_resolved() {
+        let state: SharedState = Arc::new(Mutex::new(DaemonState::default()));
+        {
+            let mut st = state.lock().unwrap();
+            for id in ["ITER-001", "ITER-002", "ITER-003", "ITER-004", "ITER-005"] {
+                st.queued.push(queued_row(id));
+            }
+        }
+
+        clear_resolved_queued(
+            &state,
+            &[
+                RetryFire::Redispatched("ITER-001".to_string()),
+                RetryFire::Released("ITER-002".to_string()),
+                RetryFire::Requeued("ITER-003".to_string()),
+                RetryFire::Deferred("ITER-004".to_string()),
+            ],
+        );
+
+        let remaining: Vec<String> = state
+            .lock()
+            .unwrap()
+            .queued
+            .iter()
+            .map(|q| q.id.clone())
+            .collect();
+        assert_eq!(
+            remaining,
+            vec![
+                "ITER-003".to_string(),
+                "ITER-004".to_string(),
+                "ITER-005".to_string()
+            ],
+            "only the re-dispatched and released rows are cleared"
         );
     }
 
@@ -2442,6 +3139,10 @@ max_concurrent = 5
             Ok(self.lookups.get(id).cloned().unwrap_or(DocLookup::Absent))
         }
 
+        fn fetch_candidate(&self, _id: &str) -> Result<Candidate, TrackerError> {
+            unimplemented!("the running-worker reconcile pass dispatches nothing")
+        }
+
         fn advance(&self, _id: &str, _target: &str) -> Result<(), TrackerError> {
             Ok(())
         }
@@ -2572,7 +3273,9 @@ max_concurrent = 5
         let projection = Projection::new(store_dir.join("log"));
         let snapshot = Snapshot::new(store_dir.clone());
         let root = repo.path().join("workspaces");
-        let wt = crate::workspace::prepare_worktree(repo.path(), &root, "ITER-500", None).unwrap();
+        let wt = crate::workspace::prepare_worktree(repo.path(), &root, "ITER-500", None)
+            .unwrap()
+            .into_worktree();
         store
             .claim("ITER-500", HOLDER, now_ms(), crate::tick::DEFAULT_LEASE_TTL)
             .unwrap();
@@ -2635,7 +3338,9 @@ max_concurrent = 5
         let projection = Projection::new(store_dir.join("log"));
         let snapshot = Snapshot::new(store_dir.clone());
         let root = repo.path().join("workspaces");
-        let wt = crate::workspace::prepare_worktree(repo.path(), &root, "ITER-501", None).unwrap();
+        let wt = crate::workspace::prepare_worktree(repo.path(), &root, "ITER-501", None)
+            .unwrap()
+            .into_worktree();
         store
             .claim("ITER-501", HOLDER, now_ms(), crate::tick::DEFAULT_LEASE_TTL)
             .unwrap();
@@ -2701,7 +3406,9 @@ max_concurrent = 5
         let projection = Projection::new(store_dir.join("log"));
         let snapshot = Snapshot::new(store_dir.clone());
         let root = repo.path().join("workspaces");
-        let wt = crate::workspace::prepare_worktree(repo.path(), &root, "ITER-502", None).unwrap();
+        let wt = crate::workspace::prepare_worktree(repo.path(), &root, "ITER-502", None)
+            .unwrap()
+            .into_worktree();
         store
             .claim("ITER-502", HOLDER, now_ms(), crate::tick::DEFAULT_LEASE_TTL)
             .unwrap();
@@ -2759,8 +3466,12 @@ max_concurrent = 5
         let projection = Projection::new(store_dir.join("log"));
         let snapshot = Snapshot::new(store_dir.clone());
         let root = repo.path().join("workspaces");
-        let wt3 = crate::workspace::prepare_worktree(repo.path(), &root, "ITER-503", None).unwrap();
-        let wt4 = crate::workspace::prepare_worktree(repo.path(), &root, "ITER-504", None).unwrap();
+        let wt3 = crate::workspace::prepare_worktree(repo.path(), &root, "ITER-503", None)
+            .unwrap()
+            .into_worktree();
+        let wt4 = crate::workspace::prepare_worktree(repo.path(), &root, "ITER-504", None)
+            .unwrap()
+            .into_worktree();
         store
             .claim("ITER-503", HOLDER, now_ms(), crate::tick::DEFAULT_LEASE_TTL)
             .unwrap();
@@ -2818,7 +3529,9 @@ max_concurrent = 5
         let projection = Projection::new(store_dir.join("log"));
         let snapshot = Snapshot::new(store_dir.clone());
         let root = repo.path().join("workspaces");
-        let wt = crate::workspace::prepare_worktree(repo.path(), &root, "ITER-600", None).unwrap();
+        let wt = crate::workspace::prepare_worktree(repo.path(), &root, "ITER-600", None)
+            .unwrap()
+            .into_worktree();
         let now = 1_000_000u64;
         store
             .claim("ITER-600", HOLDER, now, crate::tick::DEFAULT_LEASE_TTL)
@@ -2881,6 +3594,75 @@ max_concurrent = 5
         );
     }
 
+    // BUG-002 AC5: the stall kill is a retry producer like the failure path, so it
+    // owes the operator the same `queued` row — attempt, reason and the killed run's
+    // start — instead of letting the item vanish from status until the fire
+    // re-dispatches it.
+    #[tokio::test]
+    async fn a_stall_kill_surfaces_the_queued_retry_it_scheduled() {
+        let (repo, config_path, _socket) = init_project("");
+        let store_dir = config_path.parent().unwrap().to_path_buf();
+        let store = Store::open(&store_dir.join("store.redb")).unwrap();
+        let projection = Projection::new(store_dir.join("log"));
+        let snapshot = Snapshot::new(store_dir.clone());
+        let now = 1_000_000u64;
+        store
+            .claim("ITER-602", HOLDER, now, crate::tick::DEFAULT_LEASE_TTL)
+            .unwrap();
+
+        let state: SharedState = Arc::new(Mutex::new(DaemonState::default()));
+        state.lock().unwrap().running.push(RunningItem {
+            id: "ITER-602".to_string(),
+            identifier: "stalled-item".to_string(),
+            state: "in-progress".to_string(),
+            started_at_ms: 1_000,
+            worktree: repo.path().join("workspaces/ITER-602"),
+            handle: tokio::spawn(std::future::pending::<()>()),
+            last_event_at_ms: None,
+            attempt: 3,
+        });
+
+        let tracker = ReconcileTracker {
+            lookups: std::collections::HashMap::from([(
+                "ITER-602".to_string(),
+                iteration_lookup("ITER-602", "in-progress"),
+            )]),
+            fail: false,
+        };
+
+        reconcile_running_workers(
+            &tracker,
+            &RoleMapping::from_config(&load_str("").unwrap()),
+            &store,
+            &projection,
+            &snapshot,
+            &state,
+            repo.path(),
+            now,
+            100, // stall_timeout_ms; elapsed (now-1000) >> 100
+        )
+        .await;
+
+        let views: Vec<ItemView> = {
+            let state = state.lock().unwrap();
+            state.queued.iter().map(queued_view).collect()
+        };
+        assert_eq!(
+            views.len(),
+            1,
+            "the stall's durable retry must have a matching queued row"
+        );
+        assert_eq!(views[0].id, "ITER-602");
+        assert_eq!(views[0].identifier, "stalled-item");
+        assert_eq!(views[0].state, "Queued");
+        assert_eq!(views[0].attempt, Some(3), "carrying the killed run's attempt");
+        assert_eq!(views[0].error.as_deref(), Some("stalled"));
+        assert_eq!(
+            views[0].started_at_ms, 1_000,
+            "and the killed run's start, as the failure path's row carries"
+        );
+    }
+
     // STORY-011 AC2: a non-positive stall timeout skips the stall pass — the same
     // stalled timing over an active doc is retained, with no retry queued and its
     // claim intact.
@@ -2892,7 +3674,9 @@ max_concurrent = 5
         let projection = Projection::new(store_dir.join("log"));
         let snapshot = Snapshot::new(store_dir.clone());
         let root = repo.path().join("workspaces");
-        let wt = crate::workspace::prepare_worktree(repo.path(), &root, "ITER-601", None).unwrap();
+        let wt = crate::workspace::prepare_worktree(repo.path(), &root, "ITER-601", None)
+            .unwrap()
+            .into_worktree();
         let now = 1_000_000u64;
         store
             .claim("ITER-601", HOLDER, now, crate::tick::DEFAULT_LEASE_TTL)
@@ -3009,6 +3793,10 @@ max_concurrent = 5
 
         fn lookup_doc(&self, id: &str) -> Result<DocLookup, TrackerError> {
             Ok(DocLookup::Present(active_iteration(id)))
+        }
+
+        fn fetch_candidate(&self, _id: &str) -> Result<Candidate, TrackerError> {
+            unimplemented!("a failed fetch dispatches nothing")
         }
 
         fn advance(&self, _id: &str, _target: &str) -> Result<(), TrackerError> {
